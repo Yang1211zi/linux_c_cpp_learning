@@ -68,11 +68,69 @@ static int ustack_init_port(struct rte_mempool *mbuf_pool){
 }
 
 static int ustack_encode_udp_pkt(uint8_t*msg,uint8_t*data,uint16_t tol_len){
+    //ethhdr header
     struct rte_ether_hdr *ethhdr = (struct rte_ether_hdr *)msg;
     rte_memcpy(ethhdr->s_addr.addr_bytes, smac, RTE_ETHER_ADDR_LEN);
     rte_memcpy(ethhdr->d_addr.addr_bytes, dmac, RTE_ETHER_ADDR_LEN);
     ethhdr->ether_type = rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4);
+    //ip header
+    struct rte_ipv4_hdr *ip = (struct rte_ipv4_hdr*)(ethhdr + 1); //msg + sizeof(struct rte_ether_hdr);
+    //ethhdr + 1=ethhdr的地址 + sizeof(struct rte_ether_hdr)
+	ip->version_ihl = 0x45;
+	ip->type_of_service = 0;
+	ip->total_length = htons(tol_len - sizeof(struct rte_ether_hdr));
+	ip->packet_id = 0;
+	ip->fragment_offset = 0;
+	ip->time_to_live = 64;
+    ip->dst_addr=dip;
+    ip->src_addr=sip;
+    ip->next_proto_id = IPPROTO_UDP;
+    ip->hdr_checksum = 0;
+    ip->hdr_checksum=rte_hdr_cksum(ip);
+    //UDP header
+    struct rte_udp_hdr *udp = (struct rte_udp_hdr *)(ip + 1);
+    udp->src_port=sport;
+    udp->dst_port=dport;
+    udp->dgram_len=htons(tol_len - sizeof(struct rte_ether_hdr) - sizeof(struct rte_ipv4_hdr));
+    udp->dgram_cksum=0;
+    udp->dgram_cksum=rte_ipv4_udptcp_cksum(ip,udp);
+    rte_memcpy((uint8_t)(udp+1),data,udp->dgram_len);
 }
+
+static int ustack_encode_tcp_pkt(uint8_t*msg,uint16_t tol_len){
+    //ethhdr header
+    struct rte_ether_hdr *ethhdr = (struct rte_ether_hdr *)msg;
+    rte_memcpy(ethhdr->s_addr.addr_bytes, smac, RTE_ETHER_ADDR_LEN);
+    rte_memcpy(ethhdr->d_addr.addr_bytes, dmac, RTE_ETHER_ADDR_LEN);
+    ethhdr->ether_type = rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4);
+    //ip header
+    struct rte_ipv4_hdr *ip = (struct rte_ipv4_hdr*)(ethhdr + 1); //msg + sizeof(struct rte_ether_hdr);
+    //ethhdr + 1=ethhdr的地址 + sizeof(struct rte_ether_hdr)
+	ip->version_ihl = 0x45;
+	ip->type_of_service = 0;
+	ip->total_length = htons(tol_len - sizeof(struct rte_ether_hdr));
+	ip->packet_id = 0;
+	ip->fragment_offset = 0;
+	ip->time_to_live = 64;
+    ip->dst_addr=dip;
+    ip->src_addr=sip;
+    ip->next_proto_id = IPPROTO_TCP;
+    ip->hdr_checksum = 0;
+    ip->hdr_checksum=rte_hdr_cksum(ip);
+    //TCP header
+    struct rte_tcp_hdr *tcp = (struct rte_tcp_hdr *)(ip + 1);
+    memset(tcp, 0, sizeof(struct rte_tcp_hdr));
+    tcp->src_port=sport;
+    tcp->dst_port=dport;
+    tcp->sent_seq=htonl(12345);
+    tcp->recv_ack=htonl(0);
+    tcp->data_off=0x50;
+    tcp->tcp_flags=0x1<<1;
+    tcp->cksum=0;
+    tcp->cksum=rte_ipv4_udptcp_cksum(ip,tcp);
+    tcp->tcp_urp=0;
+}
+
 
 int main(int argc,char *argv[]){
     if(rte_eal_init(argc,argv)<0){//eal:环境抽象层，初始化DPDK环境，配置巨页，UIO/VFIO等参数
@@ -110,7 +168,6 @@ int main(int argc,char *argv[]){
             rte_memcpy(&dip, &iphdr->src_addr, sizeof(uint32_t));
             rte_memcpy(&sport, &udphdr->dst_port, sizeof(uint16_t));
             rte_memcpy(&dport, &udphdr->src_port, sizeof(uint16_t));
-            rte_eth_tx_burst(global_port_id, 0, &bufs[i], 1);
 
             struct in_addr addr;
 				addr.s_addr = iphdr->src_addr;
@@ -121,8 +178,50 @@ int main(int argc,char *argv[]){
 				printf("dip %s:%d --> ", inet_ntoa(addr), ntohs(udphdr->dst_port));
                 //ntohs() 把网络字节序的端口号转换成主机字节序的端口号
 
-            #endif
+                uint16_t udp_len=udphdr->dgram_len;
+                uint16_t total_len=udp_len+sizeof(struct rte_ether_hdr)+sizeof(struct rte_ipv4_hdr);
+                struct rte_mbuf*m=rte_ptkmbuf_alloc(mbuf_pool);
+                if(m==NULL){
+                    rte_exit(EXIT_FAILURE,"Cannot create tx mbuf\n");
+                }
+                m->data_len=total_len;//当前这个 mbuf 里实际有多少字节数据A
+                m->pkt_len=total_len;//整个 packet 一共有多少字节,由于这里是一个mbuf存一个packet，因此两者相等
+                uint8_t*msg=rte_pktmbuf_mtod(m,uint8_t*);//从 m 这个 mbuf 中，拿到“真正数据包数据”的起始地址，并把它当成 uint8_t * 返回。
+                ustack_encode_udp_pkt(msg,(uint8_t*)(udphdr+1),total_len);
+                rte_eth_tx_burst(global_port_id,0,&m,1);
+                #endif
             }
+
+
+                else if(iphdr->next_proto_id == IPPROTO_TCP) {
+                    struct rte_tcp_hdr *tcphdr = (struct rte_tcp_hdr *)(iphdr + 1);
+                    struct in_addr addr;
+				addr.s_addr = iphdr->src_addr;
+				printf("sip %s:%d --> ", inet_ntoa(addr), ntohs(tcphdr->src_port));
+                //inet_ntoa() 把 IPv4 的二进制地址转换成 "192.168.1.10" 这样的字符串
+
+				addr.s_addr = iphdr->dst_addr;
+				printf("dip %s:%d --> ", inet_ntoa(addr), ntohs(tcphdr->dst_port));
+                //ntohs() 把网络字节序的端口号转换成主机字节序的端口号
+
+                rte_memcpy(smac, ethhdr->s_addr.addr_bytes, RTE_ETHER_ADDR_LEN);
+                rte_memcpy(dmac, ethhdr->d_addr.addr_bytes, RTE_ETHER_ADDR_LEN);
+                rte_memcpy(&sip, &iphdr->dst_addr, sizeof(uint32_t));
+                rte_memcpy(&dip, &iphdr->src_addr, sizeof(uint32_t));
+                rte_memcpy(&sport, &tcphdr->dst_port, sizeof(uint16_t));
+                rte_memcpy(&dport, &tcphdr->src_port, sizeof(uint16_t));
+                uint16_t total_len=sizeof(struct rte_tcp_hdr)+sizeof(struct rte_ether_hdr)+sizeof(struct rte_ipv4_hdr);
+                struct rte_mbuf*m=rte_ptkmbuf_alloc(mbuf_pool);
+                if(m==NULL){
+                    rte_exit(EXIT_FAILURE,"Cannot create tx mbuf\n");
+                }
+                m->data_len=total_len;//当前这个 mbuf 里实际有多少字节数据
+                m->pkt_len=total_len;//整个 packet 一共有多少字节,由于这里是一个mbuf存一个packet，因此两者相等
+                uint8_t*msg=rte_pktmbuf_mtod(m,uint8_t*);
+                ustack_encode_tcp_pkt(msg,total_len);
+                }
+            
+            
         }
     }
 
