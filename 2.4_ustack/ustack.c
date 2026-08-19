@@ -5,6 +5,8 @@
 #define NUM_MBUFS 4096
 #define BURST_SIZE 129
 #define ENABLE_SEND 1
+#define ENABLE_TCP  1
+#define TCP_WINDOW_SIZE 14600
 
 #if ENABLE_SEND
 uint8_t smac[RTE_ETHER_ADDR_LEN];
@@ -15,6 +17,31 @@ uint32_t dip;
 
 uint16_t sport;
 uint16_t dport;
+#endif
+
+#if ENABLE_TCP
+uint8_t flags;
+uint32_t seqnum;
+uint32_t acknum;
+
+typedef enum __USTACK_TCP_STATUS {
+
+	USTACK_TCP_STATUS_CLOSED = 0,
+	USTACK_TCP_STATUS_LISTEN,
+	USTACK_TCP_STATUS_SYN_RCVD,
+	USTACK_TCP_STATUS_SYN_SENT,
+	USTACK_TCP_STATUS_ESTABLISHED,
+	USTACK_TCP_STATUS_FIN_WAIT_1,
+	USTACK_TCP_STATUS_FIN_WAIT_2,
+	USTACK_TCP_STATUS_CLOSING,
+	USTACK_TCP_STATUS_TIMEWAIT,
+	USTACK_TCP_STATUS_CLOSE_WAIT,
+	USTACK_TCP_STATUS_LAST_ACK
+	
+} USTACK_TCP_STATUS;
+
+uint8_t tcp_status = USTACK_TCP_STATUS_LISTEN;
+
 #endif
 
 int global_port_id=0;
@@ -123,9 +150,9 @@ static int ustack_encode_tcp_pkt(uint8_t*msg,uint16_t tol_len){
     tcp->src_port=sport;
     tcp->dst_port=dport;
     tcp->sent_seq=htonl(12345);
-    tcp->recv_ack=htonl(0);
+    tcp->recv_ack=htonl(seqnum+1);
     tcp->data_off=0x50;
-    tcp->tcp_flags=0x1<<1;
+    tcp->tcp_flags=RTE_TCP_SYN_FLAG|RTE_TCP_ACK_FLAG;
     tcp->cksum=0;
     tcp->cksum=rte_ipv4_udptcp_cksum(ip,tcp);
     tcp->tcp_urp=0;
@@ -210,6 +237,14 @@ int main(int argc,char *argv[]){
                 rte_memcpy(&dip, &iphdr->src_addr, sizeof(uint32_t));
                 rte_memcpy(&sport, &tcphdr->dst_port, sizeof(uint16_t));
                 rte_memcpy(&dport, &tcphdr->src_port, sizeof(uint16_t));
+
+                flags=tcphdr->tcp_flags;
+                seqnum=ntohl(tcphdr->sent_seq);
+                acknum=ntohl(tcphdr->recv_ack);
+                
+                if(tcp_flags&RTE_TCP_SYN_FLAG){
+                    if(tcp_status==USTACK_TCP_STATUS_LISTEN){
+                    
                 uint16_t total_len=sizeof(struct rte_tcp_hdr)+sizeof(struct rte_ether_hdr)+sizeof(struct rte_ipv4_hdr);
                 struct rte_mbuf*m=rte_ptkmbuf_alloc(mbuf_pool);
                 if(m==NULL){
@@ -219,8 +254,21 @@ int main(int argc,char *argv[]){
                 m->pkt_len=total_len;//整个 packet 一共有多少字节,由于这里是一个mbuf存一个packet，因此两者相等
                 uint8_t*msg=rte_pktmbuf_mtod(m,uint8_t*);
                 ustack_encode_tcp_pkt(msg,total_len);
+                rte_eth_tx_burst(global_portid, 0, &m, 1);
+                tcp_status=USTACK_TCP_STATUS_SYN_RCVD;
                 }
-            
+                }
+                else if(tcp_flags&RTE_TCP_ACK_FLAG){
+                    if(tcp_status==USTACK_TCP_STATUS_SYN_RCVD){
+                        tcp_status=USTACK_TCP_STATUS_ESTABLISHED;
+                        uint8_t hdrlen = (tcphdr->data_off >> 4) * sizeof(uint32_t);
+
+						uint8_t *data = ((uint8_t*)tcphdr + hdrlen);
+
+						printf("tcp data: %s\n", data);
+
+                    }
+                }
             
         }
     }
