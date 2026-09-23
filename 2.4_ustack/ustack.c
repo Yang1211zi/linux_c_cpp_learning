@@ -47,20 +47,31 @@ uint8_t tcp_status = USTACK_TCP_STATUS_LISTEN;
 int global_port_id=0;
 static struct rte_eth_conf port_c={//port_c配置参数对象，专门告诉 DPDK“这张网卡我要怎么配置”，网卡配置单
     .rxmode={
-        .max_rx_pkt_len=RTE_ETHER_MAX_LEN,
+        .max_rx_pkt_len=RTE_ETHER_MAX_LEN, //允许网卡接收的单个以太网帧最大长度按标准帧长度配置，大约 1518 字节
     },
 };
+/*
+rte_eth_conf结构体是通过程序告诉dpdk网卡的配置参数，我要怎么配置这张网卡
+*/
 
 /*
 nb_sys_ports为dpdk绑定的网卡的数量，后续的数据就从这个网卡接收
 */
+
+/*
+ustack_init_port()函数对网卡进行初始化
+*/
 static int ustack_init_port(struct rte_mempool *mbuf_pool){
     uint16_t nb_sys_ports = rte_eth_dev_count_avail();//返回当前 DPDK 可以使用的 Ethernet 设备数量
+    //后面所有操作都建立在一个前提上：至少存在一张 DPDK 可以使用的网卡
     if(nb_sys_ports==0){
         rte_exit(EXIT_FAILURE,"No supported eth found\n");
         printf("nb_sys_ports:%d\n",nb_sys_ports);
     }
     struct rte_eth_dev_info dev_info;
+    /*
+    rte_eth_dev_info结构体是通过dpdk获取网卡本身的信息
+    */
     rte_eth_dev_info_get(global_port_id,&dev_info);//获取网卡信息
     const int num_rx_queues=1;
     #if ENABLE_SEND
@@ -189,8 +200,8 @@ int main(int argc,char *argv[]){
 				struct rte_udp_hdr *udphdr = (struct rte_udp_hdr *)(iphdr + 1);
 
             #if ENABLE_SEND
-            rte_memcpy(smac, ethhdr->s_addr.addr_bytes, RTE_ETHER_ADDR_LEN);
-            rte_memcpy(dmac, ethhdr->d_addr.addr_bytes, RTE_ETHER_ADDR_LEN);
+            rte_memcpy(smac, ethhdr->d_addr.addr_bytes, RTE_ETHER_ADDR_LEN);
+            rte_memcpy(dmac, ethhdr->s_addr.addr_bytes, RTE_ETHER_ADDR_LEN);
             rte_memcpy(&sip, &iphdr->dst_addr, sizeof(uint32_t));
             rte_memcpy(&dip, &iphdr->src_addr, sizeof(uint32_t));
             rte_memcpy(&sport, &udphdr->dst_port, sizeof(uint16_t));
@@ -205,9 +216,9 @@ int main(int argc,char *argv[]){
 				printf("dip %s:%d --> ", inet_ntoa(addr), ntohs(udphdr->dst_port));
                 //ntohs() 把网络字节序的端口号转换成主机字节序的端口号
 
-                uint16_t udp_len=udphdr->dgram_len;
+                uint16_t udp_len=ntohs(udphdr->dgram_len);
                 uint16_t total_len=udp_len+sizeof(struct rte_ether_hdr)+sizeof(struct rte_ipv4_hdr);
-                struct rte_mbuf*m=rte_ptkmbuf_alloc(mbuf_pool);
+                struct rte_mbuf*m=rte_pktmbuf_alloc(mbuf_pool);
                 if(m==NULL){
                     rte_exit(EXIT_FAILURE,"Cannot create tx mbuf\n");
                 }

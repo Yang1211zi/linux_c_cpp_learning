@@ -377,13 +377,13 @@ struct ng_tcp_stream { // tcb control block
 
 };
 
-struct ng_tcp_table {
+struct ng_tcp_table {//管理所有tcb表的总表，同时也管理了所有epoll实例
 	int count;
 	//struct ng_tcp_stream *listener_set;	//
 #if ENABLE_SINGLE_EPOLL 
 	struct eventpoll *ep; // single epoll
 #endif
-	struct ng_tcp_stream *tcb_set;
+	struct ng_tcp_stream *tcb_set;//对应一张tcb表
 };
 
 struct ng_tcp_fragment { 
@@ -2317,22 +2317,23 @@ int nepoll_create(int size) {
 	
 	struct eventpoll *ep = (struct eventpoll*)rte_malloc("eventpoll", sizeof(struct eventpoll), 0);
 	if (!ep) {
-		set_fd_frombitmap(epfd);
+		set_fd_frombitmap(epfd);//把刚才拿出来的fd放回去
 		return -1;
 	}
 
-	struct ng_tcp_table *table = tcpInstance();
+	struct ng_tcp_table *table = tcpInstance();//整张tcp表管理所有的epoll实例和所有的tcp连接
 	table->ep = ep;
 	
 	ep->fd = epfd;
 	ep->rbcnt = 0;
-	RB_INIT(&ep->rbr);
-	LIST_INIT(&ep->rdlist);
+	ep->rdnum = 0;
+    ep->waiting = 0;
+	RB_INIT(&ep->rbr);//为所有的fd创建一个红黑树，所有的fd就存储在这个红黑树中
+	LIST_INIT(&ep->rdlist);//为已经就绪的fd创建一个链表，所有就绪的fd就存储在这个链表中
 
 	if (pthread_mutex_init(&ep->mtx, NULL)) {
 		free(ep);
 		set_fd_frombitmap(epfd);
-		
 		return -2;
 	}
 
@@ -2370,7 +2371,11 @@ int nepoll_ctl(int epfd, int op, int sockid, struct epoll_event *event) {
 	
 	struct eventpoll *ep = (struct eventpoll*)get_hostinfo_fromfd(epfd);
 	if (!ep || (!event && op != EPOLL_CTL_DEL)) {
-		errno = -EINVAL;
+		/*
+		epoll的管理结构体为空，event为NULL并且事件选择类型不为删除
+        因为只有删除时才不需要传入事件信息,event可以为NULL
+		*/
+		errno = -EINVAL;//参数无效错误码
 		return -1;
 	}
 
