@@ -6,6 +6,8 @@
 #define BURST_SIZE 129
 #define ENABLE_SEND 1
 #define ENABLE_TCP  1
+#define ECHO_SEND 0
+#define NO_ECHO 1
 #define TCP_WINDOW_SIZE 14600
 
 #if ENABLE_SEND
@@ -198,7 +200,22 @@ int main(int argc,char *argv[]){
 			if (iphdr->next_proto_id == IPPROTO_UDP) {
 
 				struct rte_udp_hdr *udphdr = (struct rte_udp_hdr *)(iphdr + 1);
-
+                uint16_t udp_len=ntohs(udphdr->dgram_len);
+                if(udp_len<sizeof(struct rte_udp_hdr)){
+                    printf("udp_len error\n");
+                    rte_pktmbuf_free(mbufs[i]);
+                    continue;
+                }
+                uint16_t udp_payload_len=udp_len-sizeof(struct rte_udp_hdr);
+                uint8_t *udp_payload = (uint8_t *)(udphdr + 1);
+                printf("udp payload: %s\n", udp_payload);
+                struct in_addr addr;
+                addr.s_addr = iphdr->src_addr;
+                printf("sip %s:%d --> ", inet_ntoa(addr), ntohs(udphdr->src_port));
+                //inet_ntoa() 把 IPv4 的二进制地址转换成 "192.168.1.10" 这样的字符串
+                addr.s_addr = iphdr->dst_addr;
+                printf("dip %s:%d -->",inet_ntoa(addr), ntohs(udphdr->dst_port));
+                
             #if ENABLE_SEND
             rte_memcpy(smac, ethhdr->d_addr.addr_bytes, RTE_ETHER_ADDR_LEN);
             rte_memcpy(dmac, ethhdr->s_addr.addr_bytes, RTE_ETHER_ADDR_LEN);
@@ -207,8 +224,7 @@ int main(int argc,char *argv[]){
             rte_memcpy(&sport, &udphdr->dst_port, sizeof(uint16_t));
             rte_memcpy(&dport, &udphdr->src_port, sizeof(uint16_t));
 
-            struct in_addr addr;
-				addr.s_addr = iphdr->src_addr;
+                addr.s_addr = iphdr->src_addr;
 				printf("sip %s:%d --> ", inet_ntoa(addr), ntohs(udphdr->src_port));
                 //inet_ntoa() 把 IPv4 的二进制地址转换成 "192.168.1.10" 这样的字符串
 
@@ -225,9 +241,11 @@ int main(int argc,char *argv[]){
                 m->data_len=total_len;//当前这个 mbuf 里实际有多少字节数据A
                 m->pkt_len=total_len;//整个 packet 一共有多少字节,由于这里是一个mbuf存一个packet，因此两者相等
                 uint8_t*msg=rte_pktmbuf_mtod(m,uint8_t*);//从 m 这个 mbuf 中，拿到“真正数据包数据”的起始地址，并把它当成 uint8_t * 返回。
+                //要注意mpool和mbuf地址是不同的,存储位置是不同的
                 ustack_encode_udp_pkt(msg,(uint8_t*)(udphdr+1),total_len);
                 rte_eth_tx_burst(global_port_id,0,&m,1);
                 #endif
+                rte_pktmbuf_free(mbufs[i]);
             }
 
 
