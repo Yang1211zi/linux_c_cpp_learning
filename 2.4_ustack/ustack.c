@@ -10,6 +10,7 @@
 #define NO_ECHO 1
 #define ENABLE_ARP 1
 #define ENABLE_ICMP 1
+#define ENABLE_ARP_REPLY 1
 #define TCP_WINDOW_SIZE 14600
 
 #if ENABLE_SEND
@@ -291,13 +292,33 @@ int main(int argc,char *argv[]){
                 if(ethhdr->ether_type == rte_cpu_to_be_16(RTE_ETHER_TYPE_ARP)) {
                     struct rte_arp_hdr *arphdr = rte_pktmbuf_mtod_offset(bufs[i], struct rte_arp_hdr *, sizeof(struct rte_ether_hdr));
                     if(arphdr->arp.data.arp_tip == sip) {
+                        if(arphdr->arp.opcode == rte_cpu_to_be_16(RTE_ARP_OP_REQUEST)) {
+
+                        
                         struct rte_mbuf*arpbuf=ng_send_arp(mbuf_pool, arphdr->arp.data.arp_sha.addr_bytes, arphdr->arp.data.arp_tha.addr_bytes, arphdr->arp.data.arp_dip, arphdr->arp.data.arp_sip);
                     rte_eth_tx_burst(global_portid, 0, &m, 1);
                     rte_pktmbuf_free(arpbuf);
-                    }
+                    
                     printf("Received ARP packet\n");
                     rte_pktmbuf_free(bufs[i]);
+                        }
+                        else if(arphdr->arp.opcode == rte_cpu_to_be_16(RTE_ARP_OP_REPLY)) {
+                            struct arp_table*table=arp_table_instance();
+                            uint8_t*mac=arp_table_mac_lookup(arphdr->arp.data.arp_sip);
+                            if(mac==NULL){
+                                arp_entry*entry=rte_malloc(NULL,sizeof(arp_entry),0);
+                                if(entry){
+                                entry->ip=arphdr->arp.data.arp_sip;
+                                rte_memcpy(entry->mac,arphdr->arp.data.arp_sha.addr_bytes,RTE_ETHER_ADDR_LEN);
+                                entry->status=ARP_ENTRY_STATUS_DYNAMIC;
+                                LL_ADD(entry,table->entries);
+                                table->count++;}
+                            }
+                            printf("Received ARP reply\n");
+                            rte_pktmbuf_free(bufs[i]);
+                        }
                     continue;
+                    }
                 }
             #endif
 			if (ethhdr->ether_type != rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4)) {
