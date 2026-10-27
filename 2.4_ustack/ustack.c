@@ -209,6 +209,20 @@ static struct rte_mbuf*ng_send_arp(struct rte_mempool *mbuf_pool,uint8_t*smac,ui
 
 #if ENABLE_ICMP
 
+static uint16_t ng_checksum(uint16_t *addr, int len) {
+    int sum = 0;
+    while (len > 1) {
+        sum += *addr++;
+        len -= 2;
+    }
+    if (len == 1) {
+        sum += *(uint8_t *)addr;
+    }
+    sum = (sum >> 16) + (sum & 0xffff);
+    sum += (sum >> 16);
+    return (uint16_t)(~sum);
+}
+
 static int ustack_encode_icmp_pkt(uint8_t*msg,uint8_t*dmac,uint32_t sip,uint32_t dip,uint16_t id,uint16_t seqnum){
     //ethhdr header
     struct rte_ether_hdr *ethhdr = (struct rte_ether_hdr *)msg;
@@ -235,7 +249,7 @@ static int ustack_encode_icmp_pkt(uint8_t*msg,uint8_t*dmac,uint32_t sip,uint32_t
     icmphdr->icmp_ident=id;
     icmphdr->icmp_seq_nb=seqnum;
     icmphdr->icmp_cksum=0;
-    icmphdr->icmp_cksum=rte_raw_cksum(icmphdr,sizeof(struct rte_icmp_hdr));
+    icmphdr->icmp_cksum=ng_checksum((uint16_t *)icmphdr, sizeof(*icmphdr));
     return 0;
 }
 
