@@ -8,6 +8,8 @@
 #define ENABLE_TCP  1
 #define ECHO_SEND 0
 #define NO_ECHO 1
+#define ENABLE_ARP 1
+#define ENABLE_ICMP 1
 #define TCP_WINDOW_SIZE 14600
 
 #if ENABLE_SEND
@@ -112,7 +114,7 @@ static int ustack_encode_udp_pkt(uint8_t*msg,uint8_t*data,uint16_t tol_len){
     struct rte_ether_hdr *ethhdr = (struct rte_ether_hdr *)msg;
     rte_memcpy(ethhdr->s_addr.addr_bytes, smac, RTE_ETHER_ADDR_LEN);
     rte_memcpy(ethhdr->d_addr.addr_bytes, dmac, RTE_ETHER_ADDR_LEN);
-    ethhdr->ether_type = rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4);
+    ethhdr->ether_type = rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4);//告诉下一层这个以太网帧后面装的是 IPv4 数据包
     //ip header
     struct rte_ipv4_hdr *ip = (struct rte_ipv4_hdr*)(ethhdr + 1); //msg + sizeof(struct rte_ether_hdr);
     //ethhdr + 1=ethhdr的地址 + sizeof(struct rte_ether_hdr)
@@ -171,6 +173,85 @@ static int ustack_encode_tcp_pkt(uint8_t*msg,uint16_t tol_len){
     tcp->tcp_urp=0;
 }
 
+#if ENABLE_ARP
+static int ustack_encode_arp_pkt(uint8_t*msg,uint8_t*smac,uint8_t*dmac,uint32_t sip,uint32_t dip){
+    //ethhdr header
+    struct rte_ether_hdr *ethhdr = (struct rte_ether_hdr *)msg;
+    rte_memcpy(ethhdr->s_addr.addr_bytes, smac, RTE_ETHER_ADDR_LEN);
+    rte_memcpy(ethhdr->d_addr.addr_bytes, dmac, RTE_ETHER_ADDR_LEN);
+    ethhdr->ether_type = rte_cpu_to_be_16(RTE_ETHER_TYPE_ARP);
+    //ARP header
+    struct rte_arp_hdr *arphdr = (struct rte_arp_hdr *)(ethhdr + 1);
+    arphdr->arp_hrd = rte_cpu_to_be_16(RTE_ARP_HRD_ETHER);
+    arphdr->arp_pro = rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4);
+    arphdr->arp_hln = RTE_ETHER_ADDR_LEN;
+    arphdr->arp_pln = sizeof(uint32_t);
+    arphdr->arp_op = rte_cpu_to_be_16(RTE_ARP_OP_REPLY);
+    rte_memcpy(arphdr->arp_data.arp_sha.addr_bytes, smac, RTE_ETHER_ADDR_LEN);
+    arphdr->arp_data.arp_sip = sip;
+    rte_memcpy(arphdr->arp_data.arp_tha.addr_bytes, dmac, RTE_ETHER_ADDR_LEN);
+    arphdr->arp_data.arp_tip = dip;
+    return 0;
+}
+
+static struct rte_mbuf*ng_send_arp(struct rte_mempool *mbuf_pool,uint8_t*smac,uint8_t*dmac,uint32_t sip,uint32_t dip){
+    struct rte_mbuf*m=rte_pktmbuf_alloc(mbuf_pool);
+    if(m==NULL){
+        rte_exit(EXIT_FAILURE,"Cannot create tx mbuf\n");
+    }
+    m->data_len=sizeof(struct rte_ether_hdr)+sizeof(struct rte_arp_hdr);
+    m->pkt_len=sizeof(struct rte_ether_hdr)+sizeof(struct rte_arp_hdr);
+    uint8_t*msg=rte_pktmbuf_mtod(m,uint8_t*);
+    ustack_encode_arp_pkt(msg, smac, dmac, sip, dip);
+    return m;
+}
+#endif
+
+#if ENABLE_ICMP
+
+static int ustack_encode_icmp_pkt(uint8_t*msg,uint8_t*dmac,uint32_t sip,uint32_t dip,uint16_t id,uint16_t seqnum){
+    //ethhdr header
+    struct rte_ether_hdr *ethhdr = (struct rte_ether_hdr *)msg;
+    rte_memcpy(ethhdr->s_addr.addr_bytes, smac, RTE_ETHER_ADDR_LEN);
+    rte_memcpy(ethhdr->d_addr.addr_bytes, dmac, RTE_ETHER_ADDR_LEN);
+    ethhdr->ether_type = rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4);
+    //ip header
+    struct rte_ipv4_hdr *ip = (struct rte_ipv4_hdr*)(ethhdr + 1); //msg + sizeof(struct rte_ether_hdr);
+    ip->version_ihl = 0x45;
+    ip->type_of_service = 0;
+    ip->total_length = htons(sizeof(struct rte_ipv4_hdr)+sizeof(struct rte_icmp_hdr));
+    ip->packet_id = 0;
+    ip->fragment_offset = 0;
+    ip->time_to_live = 64;
+    ip->dst_addr=dip;
+    ip->src_addr=sip;
+    ip->next_proto_id = IPPROTO_ICMP;
+    ip->hdr_checksum = 0;
+    ip->hdr_checksum=rte_hdr_cksum(ip);
+    //ICMP header
+    struct rte_icmp_hdr *icmphdr = ((struct rte_icmp_hdr *)msg + sizeof(struct rte_ether_hdr) + sizeof(struct rte_ipv4_hdr));
+    icmphdr->icmp_type=RTE_IP_ICMP_ECHO_REPLY;
+    icmphdr->icmp_code=0;
+    icmphdr->icmp_ident=id;
+    icmphdr->icmp_seq_nb=seqnum;
+    icmphdr->icmp_cksum=0;
+    icmphdr->icmp_cksum=rte_raw_cksum(icmphdr,sizeof(struct rte_icmp_hdr));
+    return 0;
+}
+
+static struct rte_mbuf*ng_send_icmp(struct rte_mempool *mbuf_pool,uint8_t dmac,uint32_t dip,uint32_t sip,uint16_t id,uint16_t seqnum){
+    struct rte_mbuf*m=rte_pktmbuf_alloc(mbuf_pool);
+    if(m==NULL){
+        rte_exit(EXIT_FAILURE,"Cannot create tx mbuf\n");
+    }
+    m->data_len=sizeof(struct rte_ether_hdr)+sizeof(struct rte_ipv4_hdr)+sizeof(struct rte_icmp_hdr);
+    m->pkt_len=sizeof(struct rte_ether_hdr)+sizeof(struct rte_ipv4_hdr)+sizeof(struct rte_icmp_hdr);
+    uint8_t*msg=rte_pktmbuf_mtod(m,uint8_t*);
+    ustack_encode_icmp_pkt(msg, dmac, sip, dip,id,seqnum);
+    return m;
+}
+#endif
+
 
 int main(int argc,char *argv[]){
     if(rte_eal_init(argc,argv)<0){//eal:环境抽象层，初始化DPDK环境，配置巨页，UIO/VFIO等参数
@@ -192,6 +273,19 @@ int main(int argc,char *argv[]){
             printf("Received %u packets\n",nb_rx);
             for(int i=0;i<nb_rx;i++){
                 struct rte_ether_hdr *ethhdr = rte_pktmbuf_mtod(bufs[i], struct rte_ether_hdr *);
+            #if ENABLE_ARP
+                if(ethhdr->ether_type == rte_cpu_to_be_16(RTE_ETHER_TYPE_ARP)) {
+                    struct rte_arp_hdr *arphdr = rte_pktmbuf_mtod_offset(bufs[i], struct rte_arp_hdr *, sizeof(struct rte_ether_hdr));
+                    if(arphdr->arp.data.arp_tip == sip) {
+                        struct rte_mbuf*arpbuf=ng_send_arp(mbuf_pool, arphdr->arp.data.arp_sha.addr_bytes, arphdr->arp.data.arp_tha.addr_bytes, arphdr->arp.data.arp_dip, arphdr->arp.data.arp_sip);
+                    rte_eth_tx_burst(global_portid, 0, &m, 1);
+                    rte_pktmbuf_free(arpbuf);
+                    }
+                    printf("Received ARP packet\n");
+                    rte_pktmbuf_free(bufs[i]);
+                    continue;
+                }
+            #endif
 			if (ethhdr->ether_type != rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4)) {
 				continue;
 			}
@@ -203,7 +297,7 @@ int main(int argc,char *argv[]){
                 uint16_t udp_len=ntohs(udphdr->dgram_len);
                 if(udp_len<sizeof(struct rte_udp_hdr)){
                     printf("udp_len error\n");
-                    rte_pktmbuf_free(mbufs[i]);
+                    rte_pktmbuf_free(bufs[i]);
                     continue;
                 }
                 uint16_t udp_payload_len=udp_len-sizeof(struct rte_udp_hdr);
@@ -247,6 +341,20 @@ int main(int argc,char *argv[]){
                 #endif
                 rte_pktmbuf_free(mbufs[i]);
             }
+            #if ENABLE_ICMP
+            if(iphdr->next_proto_id == IPPROTO_ICMP) {
+                struct rte_icmp_hdr *icmphdr = (struct rte_icmp_hdr *)(iphdr + 1);
+                if(icmphdr->icmp_type==RTE_IP_ICMP_ECHO_REQUEST){
+                    struct rte_mbuf*icmpbuf=ng_send_icmp(mbuf_pool, ethhdr->s_addr.addr_bytes, iphdr->src_addr, iphdr->dst_addr, icmphdr->icmp_ident, icmphdr->icmp_seq_nb);
+                    rte_eth_tx_burst(global_portid, 0, &icmpbuf, 1);
+                    rte_pktmbuf_free(icmpbuf);
+                    rte_pktmbuf_free(mbufs[i]);
+                    printf("Received ICMP echo request\n");
+                    // Handle ICMP echo request
+                }
+            }
+
+            #endif
 
 
                 else if(iphdr->next_proto_id == IPPROTO_TCP) {
