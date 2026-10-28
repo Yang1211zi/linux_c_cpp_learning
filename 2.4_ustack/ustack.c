@@ -1,6 +1,7 @@
 #include<stdio.h>
 #include<rte_eal.h>
 #include<rte_ethdev.h>
+#include "arp.h"
 
 #define NUM_MBUFS 4096
 #define BURST_SIZE 129
@@ -11,6 +12,7 @@
 #define ENABLE_ARP 1
 #define ENABLE_ICMP 1
 #define ENABLE_ARP_REPLY 1
+#define ENABLE_TIMER 1
 #define TCP_WINDOW_SIZE 14600
 
 #if ENABLE_SEND
@@ -22,6 +24,13 @@ uint32_t dip;
 
 uint16_t sport;
 uint16_t dport;
+#endif
+
+#if ENABLE_TIMER
+static uint8_t gDefaultArpMac[RTE_ETHER_ADDR_LEN] = {
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff
+};
+//
 #endif
 
 #if ENABLE_TCP
@@ -175,7 +184,7 @@ static int ustack_encode_tcp_pkt(uint8_t*msg,uint16_t tol_len){
 }
 
 #if ENABLE_ARP
-static int ustack_encode_arp_pkt(uint8_t*msg,uint8_t*smac,uint8_t*dmac,uint32_t sip,uint32_t dip){
+static int ustack_encode_arp_pkt(uint8_t*msg,uint16_t opcode,uint8_t*dmac,uint32_t sip,uint32_t dip){
     //ethhdr header
     struct rte_ether_hdr *ethhdr = (struct rte_ether_hdr *)msg;
     rte_memcpy(ethhdr->s_addr.addr_bytes, smac, RTE_ETHER_ADDR_LEN);
@@ -187,7 +196,7 @@ static int ustack_encode_arp_pkt(uint8_t*msg,uint8_t*smac,uint8_t*dmac,uint32_t 
     arphdr->arp_pro = rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4);
     arphdr->arp_hln = RTE_ETHER_ADDR_LEN;
     arphdr->arp_pln = sizeof(uint32_t);
-    arphdr->arp_op = rte_cpu_to_be_16(RTE_ARP_OP_REPLY);
+    arphdr->arp_op = rte_cpu_to_be_16(opcode);
     rte_memcpy(arphdr->arp_data.arp_sha.addr_bytes, smac, RTE_ETHER_ADDR_LEN);
     arphdr->arp_data.arp_sip = sip;
     rte_memcpy(arphdr->arp_data.arp_tha.addr_bytes, dmac, RTE_ETHER_ADDR_LEN);
@@ -195,7 +204,7 @@ static int ustack_encode_arp_pkt(uint8_t*msg,uint8_t*smac,uint8_t*dmac,uint32_t 
     return 0;
 }
 
-static struct rte_mbuf*ng_send_arp(struct rte_mempool *mbuf_pool,uint8_t*smac,uint8_t*dmac,uint32_t sip,uint32_t dip){
+static struct rte_mbuf*ng_send_arp(struct rte_mempool *mbuf_pool,uint16_t opcode,uint8_t*smac,uint8_t*dmac,uint32_t sip,uint32_t dip){
     struct rte_mbuf*m=rte_pktmbuf_alloc(mbuf_pool);
     if(m==NULL){
         rte_exit(EXIT_FAILURE,"Cannot create tx mbuf\n");
@@ -203,7 +212,7 @@ static struct rte_mbuf*ng_send_arp(struct rte_mempool *mbuf_pool,uint8_t*smac,ui
     m->data_len=sizeof(struct rte_ether_hdr)+sizeof(struct rte_arp_hdr);
     m->pkt_len=sizeof(struct rte_ether_hdr)+sizeof(struct rte_arp_hdr);
     uint8_t*msg=rte_pktmbuf_mtod(m,uint8_t*);
-    ustack_encode_arp_pkt(msg, smac, dmac, sip, dip);
+    ustack_encode_arp_pkt(msg, opcode, smac, dmac, sip, dip);
     return m;
 }
 #endif
@@ -267,8 +276,37 @@ static struct rte_mbuf*ng_send_icmp(struct rte_mempool *mbuf_pool,uint8_t dmac,u
 }
 #endif
 
+#if ENABLE_TIMER
+static void arp_request_timer(__attribute__((unused)) struct rte_timer *tim,
+	   void *arg){
+        struct rte_mempool*mbuf=(struct rte_mempool*)arg;
+        #if 0
+        ng_send_arp(mbuf,RTE_ARP_OP_REQUEST,RTE_ETHER_ADDR_LEN,ahdr->arp_data.arp_sha.addr_bytes,ahdr->arp_data.arp_sip,ahdr->arp_data.arp_tip);
+        rte_eth_tx_burst(gDpdkPortId, 0, &arpbuf, 1);
+	    rte_pktmbuf_free(arpbuf);
+        #endif
+        int i=0;
+        for(i=1;i<254;i++){
+            uint32_t dstip = (gLocalIp & 0x00FFFFFF) | (0xFF000000 & (i << 24));
+            struct in_addr addr;
+            addr.s_addr=dstip;
+            struct rte_mbuf*arpbuf=NULL;
+            uint8_t*mac_temp=arp_table_mac_lookup(dstip);
+            if(mac_temp==NULL){
+                arpbuf=ng_send_arp(mbuf,RTE_ARP_OP_REQUEST,gDefaultArpMac,dmac,sip,dstip);
+            }
+            else{
+                arpbuf=ng_send_arp(mbuf,RTE_ARP_OP_REQUEST,mac_temp,dmac,sip,dstip);
+            }
+            rte_eth_tx_burst(gDpdkPortId, 0, &arpbuf, 1);
+		rte_pktmbuf_free(arpbuf);
+        }
+       }
 
-int main(int argc,char *argv[]){
+#endif
+
+int main(int argc,char *argv[])
+{
     if(rte_eal_init(argc,argv)<0){//eal:环境抽象层，初始化DPDK环境，配置巨页，UIO/VFIO等参数
         rte_exit(EXIT_FAILURE,"Error with EAL initialization\n");
     }
@@ -277,6 +315,19 @@ int main(int argc,char *argv[]){
         rte_exit(EXIT_FAILURE,"Cannot create mbuf pool\n");
     }
     ustack_init_port(mbuf_pool);
+
+    arp_table_mac_lookup(gLocalIp);
+
+    #if ENABLE_TIMER
+    rte_timer_subsystem_init();
+
+	struct rte_timer arp_timer;
+	rte_timer_init(&arp_timer);
+
+	uint64_t hz = rte_get_timer_hz();
+	unsigned lcore_id = rte_lcore_id();
+	rte_timer_reset(&arp_timer, hz, PERIODICAL, lcore_id, arp_request_timer_cb, mbuf_pool);
+    #endif
 
     while(1){
         struct rte_mbuf *bufs[BURST_SIZE];
@@ -310,7 +361,7 @@ int main(int argc,char *argv[]){
                                 if(entry){
                                 entry->ip=arphdr->arp.data.arp_sip;
                                 rte_memcpy(entry->mac,arphdr->arp.data.arp_sha.addr_bytes,RTE_ETHER_ADDR_LEN);
-                                entry->status=ARP_ENTRY_STATUS_DYNAMIC;
+                                entry->status=ARP_ENTRY_STATUS_DYNAMIC;//动态记录通常表示：这条 IP 与 MAC 的对应关系是通过 ARP 通信自动学习得到的
                                 LL_ADD(entry,table->entries);
                                 table->count++;}
                             }
@@ -388,10 +439,9 @@ int main(int argc,char *argv[]){
                     // Handle ICMP echo request
                 }
             }
-
+        
             #endif
-
-
+        
                 else if(iphdr->next_proto_id == IPPROTO_TCP) {
                     struct rte_tcp_hdr *tcphdr = (struct rte_tcp_hdr *)(iphdr + 1);
                     struct in_addr addr;
@@ -441,11 +491,22 @@ int main(int argc,char *argv[]){
 
                     }
                 }
-            
+            }
         }
+        //
+    #if ENABLE_TIMER
+    static uint64_t prev_tsc = 0, cur_tsc;
+    uint64_t diff_tsc;
+    cur_tsc = rte_rdtsc();
+    diff_tsc = cur_tsc - prev_tsc;
+    if (diff_tsc > TIMER_RESOLUTION_CYCLES) {
+        rte_timer_manage();
+        prev_tsc = cur_tsc;
     }
+    #endif
 
     printf("hello dpdk\n");
     return 0;
-}
+     }
+    }
 }

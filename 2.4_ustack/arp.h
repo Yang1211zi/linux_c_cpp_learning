@@ -31,6 +31,36 @@ struct arp_entry{//ARP 表中的一条记录
     arp_entry*next;
 }
 
+struct arp_table {
 
+	struct arp_entry *entries;
+	int count;
+
+};
+
+static arp_table *arpt = NULL;
+
+static arp_table*arp_table_instance(void){
+    if(arpt==NULL){
+        arpt=(arp_table*)malloc(sizeof(arp_table));
+        arpt->entries=NULL;
+        arpt->count=0;
+        if(arpt==NULL){
+            rte_exit(EXIT_FAILURE,"Cannot create arp_table\n");
+        }
+    }
+    return arpt;
+}
+
+static uint8_t*arp_table_mac_lookup(uint32_t ip){
+    arp_entry*item;
+    arp_table*table=arp_table_instance();
+    for(item=table->entries;item!=NULL;item=item->next){
+        if(item->ip==ip){
+            return item->mac;
+} 
+}
+return NULL;
+}
 
 #endif
