@@ -69,6 +69,9 @@ static uint8_t gDefaultArpMac[RTE_ETHER_ADDR_LEN] = {
         struct localhost*prev;
         struct localhost*next;
     }
+
+    struct localhost*lhost=NULL;//loaclhost链表的头指针,每个连接对应一个localhost节点
+
 #endif
 
 #if ENABLE_TCP
@@ -345,6 +348,85 @@ static void arp_request_timer(__attribute__((unused)) struct rte_timer *tim,
 
 #endif
 
+#if ENABLE_UDP_APP
+
+struct udp_offload{
+    uint32_t sip;
+    uint32_t dip;
+
+    uint16_t sport;
+    uint16_t dport;
+
+    int protocol;
+
+    unsigned char*data;
+    uint16_t data_len;
+}
+
+ static int udp_process(struct rte_mbuf *mbufs){
+        struct rte_ipv4_hdr *iphdr = rte_pktmbuf_mtod_offset(mbufs, struct rte_ipv4_hdr *, sizeof(struct rte_ether_hdr));
+        struct rte_udp_hdr *udphdr = (struct rte_udp_hdr *)(iphdr + 1);\
+        struct udp_offload*udp=malloc(sizeof(struct udp_offload));
+        if(udp==NULL){
+            rte_ptkmuf_free(mbufs);
+            return -1;
+        }
+        udp->sip=iphdr->src_addr;
+        udp->dip=iphdr->dst_addr;
+        udp->sport=udphdr->src_port;
+        udp->dport=udphdr->dst_port;
+        udp->protocol=IPPROTO_UDP;
+
+        udp->data_len=ntohs(udphdr->dgram_len);
+        udp->data=rte_malloc("unsigned char*",ntohs(udphdr->dgram_len)-sizeof(struct rte_udp_hdr),0);
+        rte_memcpy(udp->data,(uint8_t *)(udphdr + 1),ntohs(udphdr->dgram_len)-sizeof(struct rte_udp_hdr));
+
+        uint16_t udp_len=ntohs(udphdr->dgram_len);
+            if(udp_len<sizeof(struct rte_udp_hdr)){
+                printf("udp_len error\n");
+                rte_pktmbuf_free(bufs[i]);
+                continue;
+            }
+                uint16_t udp_payload_len=udp_len-sizeof(struct rte_udp_hdr);
+                uint8_t *udp_payload = (uint8_t *)(udphdr + 1);
+                printf("udp payload: %s\n", udp_payload);
+                struct in_addr addr;
+                addr.s_addr = iphdr->src_addr;
+                printf("sip %s:%d --> ", inet_ntoa(addr), ntohs(udphdr->src_port));
+                //inet_ntoa() 把 IPv4 的二进制地址转换成 "192.168.1.10" 这样的字符串
+                addr.s_addr = iphdr->dst_addr;
+                printf("dip %s:%d -->",inet_ntoa(addr), ntohs(udphdr->dst_port));
+                
+            #if ENABLE_SEND
+            rte_memcpy(smac, ethhdr->d_addr.addr_bytes, RTE_ETHER_ADDR_LEN);
+            rte_memcpy(dmac, ethhdr->s_addr.addr_bytes, RTE_ETHER_ADDR_LEN);
+            rte_memcpy(&sip, &iphdr->dst_addr, sizeof(uint32_t));
+            rte_memcpy(&dip, &iphdr->src_addr, sizeof(uint32_t));
+            rte_memcpy(&sport, &udphdr->dst_port, sizeof(uint16_t));
+            rte_memcpy(&dport, &udphdr->src_port, sizeof(uint16_t));
+
+                addr.s_addr = iphdr->src_addr;
+				printf("sip %s:%d --> ", inet_ntoa(addr), ntohs(udphdr->src_port));
+                //inet_ntoa() 把 IPv4 的二进制地址转换成 "192.168.1.10" 这样的字符串
+
+				addr.s_addr = iphdr->dst_addr;
+				printf("dip %s:%d --> ", inet_ntoa(addr), ntohs(udphdr->dst_port));
+                //ntohs() 把网络字节序的端口号转换成主机字节序的端口号
+
+                uint16_t udp_len=ntohs(udphdr->dgram_len);
+                uint16_t total_len=udp_len+sizeof(struct rte_ether_hdr)+sizeof(struct rte_ipv4_hdr);
+                struct rte_mbuf*m=rte_pktmbuf_alloc(mbufs);
+                if(m==NULL){
+                    rte_exit(EXIT_FAILURE,"Cannot create tx mbuf\n");
+                }
+                m->data_len=total_len;//当前这个 mbuf 里实际有多少字节数据A
+                m->pkt_len=total_len;//整个 packet 一共有多少字节,由于这里是一个mbuf存一个packet，因此两者相等
+                uint8_t*msg=rte_pktmbuf_mtod(m,uint8_t*);//从 m 这个 mbuf 中，拿到“真正数据包数据”的起始地址，并把它当成 uint8_t * 返回。
+                rte_pktmbuf_free(mbufs[i]);
+    }
+#endif
+
+
 #if ENABLE_MULTHREAD
     static int ptk_pocess(__attribute__((unused)) void* arg){
         struct mempool*mbuf_pool = (struct mempool*)arg;
@@ -394,55 +476,7 @@ static void arp_request_timer(__attribute__((unused)) struct rte_timer *tim,
 
 			struct rte_ipv4_hdr *iphdr = rte_pktmbuf_mtod_offset(bufs[i], struct rte_ipv4_hdr *, sizeof(struct rte_ether_hdr));
 			if (iphdr->next_proto_id == IPPROTO_UDP) {
-
-				struct rte_udp_hdr *udphdr = (struct rte_udp_hdr *)(iphdr + 1);
-                uint16_t udp_len=ntohs(udphdr->dgram_len);
-                if(udp_len<sizeof(struct rte_udp_hdr)){
-                    printf("udp_len error\n");
-                    rte_pktmbuf_free(bufs[i]);
-                    continue;
-                }
-                uint16_t udp_payload_len=udp_len-sizeof(struct rte_udp_hdr);
-                uint8_t *udp_payload = (uint8_t *)(udphdr + 1);
-                printf("udp payload: %s\n", udp_payload);
-                struct in_addr addr;
-                addr.s_addr = iphdr->src_addr;
-                printf("sip %s:%d --> ", inet_ntoa(addr), ntohs(udphdr->src_port));
-                //inet_ntoa() 把 IPv4 的二进制地址转换成 "192.168.1.10" 这样的字符串
-                addr.s_addr = iphdr->dst_addr;
-                printf("dip %s:%d -->",inet_ntoa(addr), ntohs(udphdr->dst_port));
-                
-            #if ENABLE_SEND
-            rte_memcpy(smac, ethhdr->d_addr.addr_bytes, RTE_ETHER_ADDR_LEN);
-            rte_memcpy(dmac, ethhdr->s_addr.addr_bytes, RTE_ETHER_ADDR_LEN);
-            rte_memcpy(&sip, &iphdr->dst_addr, sizeof(uint32_t));
-            rte_memcpy(&dip, &iphdr->src_addr, sizeof(uint32_t));
-            rte_memcpy(&sport, &udphdr->dst_port, sizeof(uint16_t));
-            rte_memcpy(&dport, &udphdr->src_port, sizeof(uint16_t));
-
-                addr.s_addr = iphdr->src_addr;
-				printf("sip %s:%d --> ", inet_ntoa(addr), ntohs(udphdr->src_port));
-                //inet_ntoa() 把 IPv4 的二进制地址转换成 "192.168.1.10" 这样的字符串
-
-				addr.s_addr = iphdr->dst_addr;
-				printf("dip %s:%d --> ", inet_ntoa(addr), ntohs(udphdr->dst_port));
-                //ntohs() 把网络字节序的端口号转换成主机字节序的端口号
-
-                uint16_t udp_len=ntohs(udphdr->dgram_len);
-                uint16_t total_len=udp_len+sizeof(struct rte_ether_hdr)+sizeof(struct rte_ipv4_hdr);
-                struct rte_mbuf*m=rte_pktmbuf_alloc(mbuf_pool);
-                if(m==NULL){
-                    rte_exit(EXIT_FAILURE,"Cannot create tx mbuf\n");
-                }
-                m->data_len=total_len;//当前这个 mbuf 里实际有多少字节数据A
-                m->pkt_len=total_len;//整个 packet 一共有多少字节,由于这里是一个mbuf存一个packet，因此两者相等
-                uint8_t*msg=rte_pktmbuf_mtod(m,uint8_t*);//从 m 这个 mbuf 中，拿到“真正数据包数据”的起始地址，并把它当成 uint8_t * 返回。
-                //要注意mpool和mbuf地址是不同的,存储位置是不同的
-                ustack_encode_udp_pkt(msg,(uint8_t*)(udphdr+1),total_len);
-                //rte_eth_tx_burst(global_port_id,0,&m,1);
-                rte_ring_mp_enqueue_burst(ring->out, (void **)&m, 1, NULL);
-                #endif
-                //rte_pktmbuf_free(mbufs[i]);
+                  udp_process(bufs[i]);
             }
             #if ENABLE_ICMP
             if(iphdr->next_proto_id == IPPROTO_ICMP) {
@@ -525,9 +559,71 @@ static void arp_request_timer(__attribute__((unused)) struct rte_timer *tim,
         return fd;
     }
 
+    static struct localhost* gethostinfo_from_fd(int fd){
+        struct localhost*host;
+        for(host=lhost;host!=NULL;host=host->next){
+            if(host->fd==fd)
+            return host;
+        }
+        return NULL;
+    }
+
     static int socket(int domain, int type, int protocol)
     {
         int fd = get_fd_from_bitmap();
+        struct localhost*host=rte_malloc("localhost",sizeof(struct localhost),0);
+        memset(host,0,sizeof(struct localhost));
+        if(host==NULL){
+            return -1;
+        }
+        host->fd=fd;
+        if(type==SOCK_DGRAM)
+            host->protocol=IPPROTO_UDP;
+        else if(type==SOCK_STREAM){
+            host->protocol=IPPROTO_TCP;
+        }
+
+        host->rbuf=rte_ring_create("recv buffer",RING_SIZE,rte_socket_id(),RING_F_SP_ENQ|RING_F_SC_DEQ);
+        if(host->rbuf==NULL){
+            rte_free(host);
+            return -1;
+        }
+        host->sbuf=rte_ring_create("send buffer",RING_SIZE,rte_socket_id(),RING_F_SP_ENQ|RING_F_SC_DEQ);
+        if(host->sbuf==NULL){
+            rte_free(host);
+            return -1;
+        }
+
+        LL_ADD(host,lhost);
+        return fd;
+    }
+
+    static int bind(int sockfd,const struct sockaddr *addr,socklen_t addrlen){
+        struct localhost*host=gethostinfo_from_fd(sockfd);
+        if(host==NULL)
+        return -1;
+        struct sockaddr_in*localaddr=(struct sockaddr_in*)addr;
+        //struct sockaddr 没有 sin_port、`sin_addr` 这些 IPv4 专用成员
+        //把通用地址指针 addr 转换成 IPv4 地址结构体指针，方便访问 IP 和端口
+
+        host->localport=localaddr->sin_port;
+        rte_memcpy(host->localmac,smac,RTE_ETHER_ADDR_LEN);
+        rte_memcpy(host->localip,&localaddr->sin_addr.s_addr,sizeof(uint32_t));
+        return 0;
+    }
+
+    static int close(int sockfd){
+        struct localhost*host=gethostinfo_from_fd(sockfd);
+        if(host==NULL){
+            return -1;
+        }
+        LL_REMOVE(host,lhost);
+        if(host->rbuf)
+            rte_ring_free(host->rbuf);
+        if(host->sbuf)
+            rte_ring_free(host->sbuf);  
+        rte_free(host);
+        return 0;
     }
 
     int udp_server_entry(int argc,char*argv[]){
@@ -558,6 +654,9 @@ static void arp_request_timer(__attribute__((unused)) struct rte_timer *tim,
             close(connfd);
         }
     }
+
+   
+
 #endif
 
 int main(int argc,char *argv[])
