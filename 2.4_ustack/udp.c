@@ -414,47 +414,43 @@ static struct localhost* gethost_from_ip_port(uint32_t dip,uint16_t dport,uint8_
 
 
 #if ENABLE_MULTHREAD
-    static int ptk_pocess(__attribute__((unused)) void* arg){
+    static int pkt_process(__attribute__((unused)) void* arg){
         struct mempool*mbuf_pool = (struct mempool*)arg;
         struct inout_ring*ring=rinstance();
         while(1){
-            struct rte_mbuf *bufs[BURST_SIZE];
-            unsigned int nb_rx = rte_ring_mc_dequeue_burst(ring->in, (void **)bufs, BURST_SIZE, NULL);
-             for(int i=0;i<nb_rx;i++){
-                struct rte_ether_hdr *ethhdr = rte_pktmbuf_mtod(bufs[i], struct rte_ether_hdr *);
-                 #if ENABLE_ARP
-                if(ethhdr->ether_type == rte_cpu_to_be_16(RTE_ETHER_TYPE_ARP)) {
-                    struct rte_arp_hdr *arphdr = rte_pktmbuf_mtod_offset(bufs[i], struct rte_arp_hdr *, sizeof(struct rte_ether_hdr));
-                    if(arphdr->arp.data.arp_tip == sip) {
-                        if(arphdr->arp.opcode == rte_cpu_to_be_16(RTE_ARP_OP_REQUEST)) {
-
-                        
-                    struct rte_mbuf*arpbuf=ng_send_arp(mbuf_pool, arphdr->arp.data.arp_sha.addr_bytes, arphdr->arp.data.arp_tha.addr_bytes, arphdr->arp.data.arp_dip, arphdr->arp.data.arp_sip);
-                    //rte_eth_tx_burst(global_portid, 0, &m, 1);
-                    //rte_pktmbuf_free(arpbuf);
-                    rte_ring_mp_enqueue_burst(ring->out, (void **)&arpbuf, 1, NULL);
-
-                    printf("Received ARP packet\n");
-                    rte_pktmbuf_free(bufs[i]);
-                        }
-                        else if(arphdr->arp.opcode == rte_cpu_to_be_16(RTE_ARP_OP_REPLY)) {
-                            struct arp_table*table=arp_table_instance();
-                            uint8_t*mac=arp_table_mac_lookup(arphdr->arp.data.arp_sip);
-                            if(mac==NULL){
-                                arp_entry*entry=rte_malloc(NULL,sizeof(arp_entry),0);
-                                if(entry){
+        struct rte_mbuf *bufs[BURST_SIZE];
+        unsigned int nb_rx = rte_ring_mc_dequeue_burst(ring->in, (void **)bufs, BURST_SIZE, NULL);
+        for(int i=0;i<nb_rx;i++){
+            struct rte_ether_hdr *ethhdr = rte_pktmbuf_mtod(bufs[i], struct rte_ether_hdr *);
+            #if ENABLE_ARP
+            if(ethhdr->ether_type == rte_cpu_to_be_16(RTE_ETHER_TYPE_ARP)) {
+                struct rte_arp_hdr *arphdr = rte_pktmbuf_mtod_offset(bufs[i], struct rte_arp_hdr *, sizeof(struct rte_ether_hdr));
+                if(arphdr->arp.data.arp_tip == sip) {
+                    if(arphdr->arp.opcode == rte_cpu_to_be_16(RTE_ARP_OP_REQUEST)) {
+                        struct rte_mbuf*arpbuf=ng_send_arp(mbuf_pool, arphdr->arp.data.arp_sha.addr_bytes, arphdr->arp.data.arp_tha.addr_bytes, arphdr->arp.data.arp_dip, arphdr->arp.data.arp_sip);
+                        rte_ring_mp_enqueue_burst(ring->out, (void **)&arpbuf, 1, NULL);
+                        printf("Received ARP packet\n");
+                        rte_pktmbuf_free(bufs[i]);
+                    }
+                    else if(arphdr->arp.opcode == rte_cpu_to_be_16(RTE_ARP_OP_REPLY)) {
+                        struct arp_table*table=arp_table_instance();
+                        uint8_t*mac=arp_table_mac_lookup(arphdr->arp.data.arp_sip);
+                        if(mac==NULL){
+                            arp_entry*entry=rte_malloc(NULL,sizeof(arp_entry),0);
+                            if(entry){
                                 entry->ip=arphdr->arp.data.arp_sip;
                                 rte_memcpy(entry->mac,arphdr->arp.data.arp_sha.addr_bytes,RTE_ETHER_ADDR_LEN);
                                 entry->status=ARP_ENTRY_STATUS_DYNAMIC;//动态记录通常表示：这条 IP 与 MAC 的对应关系是通过 ARP 通信自动学习得到的
                                 LL_ADD(entry,table->entries);
-                                table->count++;}
+                                table->count++;
                             }
-                            printf("Received ARP reply\n");
-                            rte_pktmbuf_free(bufs[i]);
                         }
-                    continue;
+                        printf("Received ARP reply\n");
+                        rte_pktmbuf_free(bufs[i]);
                     }
+                    continue;
                 }
+            }
             #endif
 			if (ethhdr->ether_type != rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4)) {
 				continue;
@@ -657,8 +653,8 @@ static ssize_t recvfrom(int sockfd, void *buf, size_t len, int flags, struct soc
         }
     }
 
-    static ssize_t nsendto(int sockfd, const void *buf, size_t len,__attribute__((unused)) int flags,
-    const struct sockaddr *dest_addr,__attribute__((unused)) socklen_t addrlen) {
+static ssize_t nsendto(int sockfd, const void *buf, size_t len,__attribute__((unused)) int flags,
+const struct sockaddr *dest_addr,__attribute__((unused)) socklen_t addrlen) {
         struct localhost*host=gethostinfo_from_fd(sockfd);
         if(host==NULL)
         return -1;
@@ -686,7 +682,65 @@ static ssize_t recvfrom(int sockfd, void *buf, size_t len, int flags, struct soc
         return len;
     }
 
-    static int udp_out(struct rte_mempool*mbuf){
+static int ng_encode_udp_apppkt(uint8_t *msg, uint32_t sip, uint32_t dip,
+uint16_t sport, uint16_t dport, uint8_t *smac, uint8_t *dmac,
+unsigned char *data, uint16_t total_len){
+    //ethhdr header
+    struct rte_ether_hdr *ethhdr = (struct rte_ether_hdr *)msg;
+    rte_memcpy(ethhdr->s_addr.addr_bytes, smac, RTE_ETHER_ADDR_LEN);
+    rte_memcpy(ethhdr->d_addr.addr_bytes, dmac, RTE_ETHER_ADDR_LEN);
+    ethhdr->ether_type = rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4);//告诉下一层这个以太网帧后面装的是 IPv4 数据包
+    //ip header
+    struct rte_ipv4_hdr *ip = (struct rte_ipv4_hdr*)(ethhdr + 1); //msg + sizeof(struct rte_ether_hdr);
+    //ethhdr + 1=ethhdr的地址 + sizeof(struct rte_ether_hdr)
+	ip->version_ihl = 0x45;
+	ip->type_of_service = 0;
+	ip->total_length = htons(tol_len - sizeof(struct rte_ether_hdr));
+	ip->packet_id = 0;
+	ip->fragment_offset = 0;
+	ip->time_to_live = 64;
+    ip->dst_addr=dip;
+    ip->src_addr=sip;
+    ip->next_proto_id = IPPROTO_UDP;
+    ip->hdr_checksum = 0;
+    ip->hdr_checksum=rte_hdr_cksum(ip);
+    //UDP header
+    struct rte_udp_hdr *udp = (struct rte_udp_hdr *)(ip + 1);
+    udp->src_port=sport;
+    udp->dst_port=dport;
+    udp->dgram_len=htons(tol_len - sizeof(struct rte_ether_hdr) - sizeof(struct rte_ipv4_hdr));
+    udp->dgram_cksum=0;
+    udp->dgram_cksum=rte_ipv4_udptcp_cksum(ip,udp);
+    rte_memcpy((uint8_t)(udp+1),data,udp->dgram_len);
+    return 0;
+}
+
+
+static struct rte_mbuf * ng_udp_pkt(struct rte_mempool *mbuf_pool, uint32_t sip, uint32_t dip,
+	uint16_t sport, uint16_t dport, uint8_t *srcmac, uint8_t *dstmac,
+	uint8_t *data, uint16_t length) {
+
+	// mempool --> mbuf
+
+	const unsigned total_len = length + 42;
+
+	struct rte_mbuf *mbuf = rte_pktmbuf_alloc(mbuf_pool);
+	if (!mbuf) {
+		rte_exit(EXIT_FAILURE, "rte_pktmbuf_alloc\n");
+	}
+	mbuf->pkt_len = total_len;
+	mbuf->data_len = total_len;
+
+	uint8_t *pktdata = rte_pktmbuf_mtod(mbuf, uint8_t*);
+
+	ng_encode_udp_apppkt(pktdata, sip, dip, sport, dport, srcmac, dstmac,
+		data, total_len);
+
+	return mbuf;
+
+}
+
+static int udp_out(struct rte_mempool*mbuf){
         struct localhost*host;
         for(host=lhost;host!=NULL;host=host->next){
             struct offload *ol;
@@ -696,10 +750,21 @@ static ssize_t recvfrom(int sockfd, void *buf, size_t len, int flags, struct soc
             uint8_t macaddr=arp_table_mac_lookup();
 
             if(macaddr == NULL){
-                
+               struct rte_mbuf*arpbuf = ng_send_arp(mbuf, RTE_ARP_OP_REQUEST, gDefaultArpMac, 
+				ol->sip, ol->dip);
+
+                struct inout_ring *ring = ringInstance();
+                rte_ring_mp_enqueue_burst(ring->out, (void **)&arpbuf, 1, NULL);
+                rte_ring_mp_enqueue(host->sndbuf, ol);
+            }
+            else{
+                struct rte_mbuf *udpbuf = ng_udp_pkt(mbuf, udp->sip, udp->dip, udp->sport, udp->dport,
+				host->localmac, dstmac, udp->data, udp->length);
+
+			struct inout_ring *ring = ringInstance();
+			rte_ring_mp_enqueue_burst(ring->out, (void **)&udpbuf, 1, NULL);
             }
         }
-
     }
 
     int udp_server_entry(int argc,char*argv[]){
@@ -730,8 +795,6 @@ static ssize_t recvfrom(int sockfd, void *buf, size_t len, int flags, struct soc
             close(connfd);
         }
     }
-
-   
 
 #endif
 
