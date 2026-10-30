@@ -620,8 +620,86 @@ static struct localhost* gethost_from_ip_port(uint32_t dip,uint16_t dport,uint8_
 
 static ssize_t recvfrom(int sockfd, void *buf, size_t len, int flags, struct sockaddr *src_addr, socklen_t *addrlen){
         struct localhost*host=gethostinfo_from_fd(sockfd);
+        if(host==NULL)
+        return -1;
 
+        struct udp_offload*udp=NULL;
+        unsigned char *ptr=NULL;
+
+        struct sockaddr_in*addr=(struct sockaddr_in*)src_addr;
+        int nb=-1;
+        pthread_mutex_lock(&host->mutex);
+        while((nb=rte_ring_mc_dequeue(host->rcvbuf, (void **)&ol))<0){
+            pthread_cond_wait(&host->cond,&host->mutex);
+        }
+        pthread_mutex_unlock(&host->mutex);
         
+        addr.sin_port=udp->sport;
+        rte_memcpy(&addr.sin_addr.s_addr,&udp->sip,sizeof(uint32_t));
+
+        if(udp->data_len>len){
+        rte_memcpy(buf,udp->data,len);
+        ptr=rte_malloc("unsigned char *",udp->data_len-len,0);
+        rte_memcpy(ptr,udp->data+len,udp->data_len-len);
+
+        rte_free(udp->data);
+        udp->data=ptr;
+        udp->data_len=udp->data_len-len;
+        rte_ring_mp_enqueue(host->rbuf,udp);
+        return len;
+        }
+        else{
+            rte_memcpy(buf,udp->data,udp->data_len);
+            rte_free(udp->data);
+            rte-free(udp);
+
+            return udp->data_len;
+        }
+    }
+
+    static ssize_t nsendto(int sockfd, const void *buf, size_t len,__attribute__((unused)) int flags,
+    const struct sockaddr *dest_addr,__attribute__((unused)) socklen_t addrlen) {
+        struct localhost*host=gethostinfo_from_fd(sockfd);
+        if(host==NULL)
+        return -1;
+
+        struct sockaddr_in*addr=(struct sockaddr_in*)src_addr;
+        struct udp_offload *udp=rte_malloc(rte_malloc("offload", sizeof(struct offload), 0));
+
+        udp->sip=host->localip;
+        udp->dip=addr->sin_addr.s_addr;
+        udp->sport=host->localport;
+        udp->dport=addr->sin_port;
+        udp->data_len=len;
+
+        struct in_addr addr;
+        addr.s_addr = udp->dip;
+
+        udp->data=rte_malloc("unsigned char *", len, 0);
+        if(udp->data==NULL){
+            rte_free(udp);
+            return -2;
+        }
+
+        rte_memcpy(udp->data,buf,len);
+        rte_ring_mp_enqueue(host->sbuf, udp);
+        return len;
+    }
+
+    static int udp_out(struct rte_mempool*mbuf){
+        struct localhost*host;
+        for(host=lhost;host!=NULL;host=host->next){
+            struct offload *ol;
+            int nb_snd = rte_ring_mc_dequeue(host->sndbuf, (void **)&ol);
+            if (nb_snd < 0) continue;
+
+            uint8_t macaddr=arp_table_mac_lookup();
+
+            if(macaddr == NULL){
+                
+            }
+        }
+
     }
 
     int udp_server_entry(int argc,char*argv[]){
