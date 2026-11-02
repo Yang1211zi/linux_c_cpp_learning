@@ -806,6 +806,8 @@ static int udp_out(struct rte_mempool*mbuf){
 #if ENABLE_TCP_APP
 
 #define TCP_OPTION_LENGTH 8
+#define TCP_MAX_SEQ 4294967295
+#define TCP_INITIAL_WINDOW  14600
 
 typedef enum _NG_TCP_STATUS {
 
@@ -895,7 +897,48 @@ static struct ng_tcp_stream* ng_tcp_stream_search(uint32_t sip,uint32_t dip,uint
 }
 
 static struct ng_tcp_stream* ng_tcp_stream_create(uint32_t sip,uint32_t dip,uint16_t sport,uint16_t dport){
+    struct ng_tcp_stream*stream=rte_malloc("ng_tcp_stream",sizeof(struct ng_tcp_stream),0);
+    if(stream==NULL)
+    return NULL;
+    memset(stream,0,sizeof(struct ng_tcp_stream));
+    
+    stream->sip=sip;
+    stream->dip=dip;
+    stream->sport=sport;
+    stream->dport=dport;
+    stream->protocol=IPPROTO_TCP;
+    stream->status=NG_TCP_STATUS_LISTEN;
+    stream->sndbuf=rte_ring_create("sndbuf",RING_SIZE,rte_socket_id(),0);
+    stream->rcvbuf=rte_ring_create("rcvbuf",RING_SIZE,rte_socket_id(),0);
 
+    rte_memcpy(stream->localmac,smac,RTE_ETHER_ADDR_LEN);
+
+    uint32_t next_seed = time(NULL);
+	stream->snd_nxt = rand_r(&next_seed) % TCP_MAX_SEQ;
+    
+    struct ng_tcp_table *table = tcpInstance();
+	LL_ADD(stream, table->tcb_set);
+
+    return stream;
+}
+
+static int ng_tcp_handle_listen(struct ng_tcp_stream *stream, struct rte_tcp_hdr *tcphdr) {
+    if (tcphdr->tcp_flags & RTE_TCP_SYN_FLAG) {
+        if(stream->status == NG_TCP_STATUS_LISTEN){
+            struct ng_tcp_fragment *fragment = rte_malloc("ng_tcp_fragment", sizeof(struct ng_tcp_fragment), 0);
+            if(fragment==NULL)
+            return -1;
+        memset(fragment,0,sizeof(struct ng_tcp_fragment));
+
+        fragment->sport = tcphdr->dst_port;
+        fragment->dport = tcphdr->src_port;
+        fragment->seqnum = stream->snd_nxt;
+        fragment->acknum = ntohl(tcphdr->sent_seq) + 1;
+        fragment->tcp_flags = RTE_TCP_SYN_FLAG | RTE_TCP_ACK_FLAG;
+        fragment->windows = TCP_INITIAL_WINDOW;
+        fragment->hdrlen_off=
+        }
+    }   
 }
 
 static int ng_tcp_process(struct rte_mbuf *mbufs){
@@ -911,7 +954,9 @@ static int ng_tcp_process(struct rte_mbuf *mbufs){
 
     struct tcp_stream* tcp_stream=ng_tcp_stream_search(iphdr->src_addr,iphdr->dst_addr,tcphdr->src_port,tcphdr->dst_port);
     if(tcp_stream==NULL){
-        ng_tcp_stream_create(iphdr->src_addr,iphdr->dst_addr,tcphdr->src_port,tcphdr->dst_port);
+        tcp_stream = ng_tcp_stream_create(iphdr->src_addr,iphdr->dst_addr,tcphdr->src_port,tcphdr->dst_port);
+        if(tcp_stream==NULL)
+        return -2;
     }
 
 }
