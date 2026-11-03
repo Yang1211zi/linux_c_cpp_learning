@@ -847,8 +847,9 @@ struct ng_tcp_stream{
 
     uint8_t localmac[RTE_ETHER_ADDR_LEN];
 
-    uint32_t snd_nxt; // seqnum
-	uint32_t rcv_nxt; // acknum
+    uint32_t snd_nxt; // seqnum 本次从哪个序号开始发送。以服务器为例，
+    //本次服务器期望发送的序号就是上次客户端发包中客户端期望从哪里开始接收的序号
+	uint32_t rcv_nxt; // acknum 希望下次从哪里开始接受
 
 	NG_TCP_STATUS status;
 
@@ -941,6 +942,7 @@ static int ng_tcp_handle_listen(struct ng_tcp_stream *stream, struct rte_tcp_hdr
         fragment->dport = tcphdr->src_port;
         fragment->seqnum = stream->snd_nxt;
         fragment->acknum = ntohl(tcphdr->sent_seq) + 1;
+        stream->rcv_nxt = fragment->acknum;
         fragment->tcp_flags = RTE_TCP_SYN_FLAG | RTE_TCP_ACK_FLAG;
         fragment->windows = TCP_INITIAL_WINDOW;
         fragment->hdrlen_off = 0x50;
@@ -1028,6 +1030,87 @@ static int ng_tcp_handle_syn_rcvd(struct ng_tcp_stream *stream, struct rte_tcp_h
         }
         stream->status = NG_TCP_STATUS_ESTABLISHED;
     }
+    return 0;
+}
+
+static int ng_tcp_handle_established(struct ng_tcp_stream *stream, struct rte_tcp_hdr *tcphdr, int tcplen) {
+    if (tcphdr->tcp_flags & RTE_TCP_PSH_FLAG){
+    //recv buffer
+    struct ng_tcp_fragment * rfragment = rte_malloc("ng_tcp_fragment", sizeof(struct ng_tcp_fragment), 0);
+    if(rfragment==NULL)
+    return -1;
+    memset(rfragment,0,sizeof(struct ng_tcp_fragment));
+    rfragment->sport = tcphdr->src_port;
+    rfragment->dport = tcphdr->dst_port;
+    uint8_t hdrlen = tcphdr->data_off >> 4;
+    int payload_len = tcplen-hdrlen*4;
+    if(payload_len>0){
+        rfragment->data=rte_malloc("unsigned char*",payload_len+1,0);
+        if(rfragment->data==NULL){
+            rte_free(rfragment);
+            return -2;
+        }
+        memset(rfragment->data,0,payload_len+1);
+        uint8_t *payload = (uint8_t*)tcphdr+hdrlen*4;
+        rte_memcpy(rfragment->data,payload,payload_len);
+        rfragment->length=payload_len;
+    }
+    rte_ring_mp_enqueue(stream->rcvbuf,rfragment);
+
+    //ack ptk
+    struct ng_tcp_fragment * ackfrag = rte_malloc("ng_tcp_fragment", sizeof(struct ng_tcp_fragment), 0);
+    if(ackfrag==NULL){
+        rte_free(rfragment);
+        return -3;
+    }
+    memset(ackfrag, 0, sizeof(struct ng_tcp_fragment));
+    ackfrag->dport = tcphdr->src_port;
+	ackfrag->sport = tcphdr->dst_port;
+    stream->rcv_nxt = stream->rcv_nxt + payloadlen;
+    // local 
+    stream->snd_nxt = ntohl(tcphdr->recv_ack);
+    //ackfrag->
+
+    ackfrag->acknum = stream->rcv_nxt;
+    ackfrag->seqnum = stream->snd_nxt;
+
+    ackfrag->tcp_flags = RTE_TCP_ACK_FLAG;
+    ackfrag->windows = TCP_INITIAL_WINDOW;
+    ackfrag->hdrlen_off = 0x50;
+    ackfrag->data = NULL;
+    ackfrag->length = 0;
+    
+    rte_ring_mp_enqueue(stream->sndbuf, ackfrag);
+
+    //echo ptk
+    struct ng_tcp_fragment * echofrag = rte_malloc("ng_tcp_fragment", sizeof(struct ng_tcp_fragment), 0);
+    if(echofrag==NULL){
+        rte_free(echofrag);
+        return -4;
+    }
+    memset(echofrag, 0, sizeof(struct ng_tcp_fragment));
+    echofrag->dport = tcphdr->src_port;
+	echofrag->sport = tcphdr->dst_port;
+    stream->rcv_nxt = stream->rcv_nxt + payloadlen;
+    stream->snd_nxt = ntohl(tcphdr->recv_ack);
+    echofrag->acknum = stream->rcv_nxt;
+    echofrag->seqnum = stream->snd_nxt;
+    echofrag->tcp_flags = RTE_TCP_ACK_FLAG;
+    echofrag->windows = TCP_INITIAL_WINDOW;
+    echofrag->hdrlen_off = 0x50;
+    
+    echofrag->data=rte_malloc("unsigned char*",payload_len+1,0);
+    if(echofrag->data==NULL){
+        rte_free(echofrag);
+        return -2;
+    }
+    memset(echofrag->data,0,payload_len+1);
+    uint8_t *payload = (uint8_t*)tcphdr+hdrlen*4;
+    rte_memcpy(echofrag->data,payload,payload_len);
+    echofrag->length=payload_len;
+    rte_ring_mp_enqueue(stream->sndbuf,echofrag);
+    }
+
     return 0;
 }
 
