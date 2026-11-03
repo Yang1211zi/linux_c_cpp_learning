@@ -553,11 +553,17 @@ static struct localhost* gethost_from_ip_port(uint32_t dip,uint16_t dport,uint8_
         return fd;
     }
 
-    static struct localhost* gethostinfo_from_fd(int fd){
+    static void* gethostinfo_from_fd(int fd){
         struct localhost*host;
         for(host=lhost;host!=NULL;host=host->next){
             if(host->fd==fd)
             return host;
+        }
+        struct ng_tcp_stream*stream;
+        srtuct ng_tcp_table*table=ng_tcp_table_instance();
+        for(stream=table->tcb_set;stream!=NULL;stream=stream->next){
+            if(stream->fd==fd)
+            return stream;
         }
         return NULL;
     }
@@ -565,17 +571,14 @@ static struct localhost* gethost_from_ip_port(uint32_t dip,uint16_t dport,uint8_
     static int nsocket(int domain, int type, int protocol)
     {
         int fd = get_fd_from_bitmap();
+        if(type==SOCK_DGRAM){
         struct localhost*host=rte_malloc("localhost",sizeof(struct localhost),0);
         memset(host,0,sizeof(struct localhost));
         if(host==NULL){
             return -1;
         }
         host->fd=fd;
-        if(type==SOCK_DGRAM)
-            host->protocol=IPPROTO_UDP;
-        else if(type==SOCK_STREAM){
-            host->protocol=IPPROTO_TCP;
-        }
+        host->protocol=IPPROTO_UDP;
 
         host->rbuf=rte_ring_create("recv buffer",RING_SIZE,rte_socket_id(),RING_F_SP_ENQ|RING_F_SC_DEQ);
         if(host->rbuf==NULL){
@@ -593,24 +596,65 @@ static struct localhost* gethost_from_ip_port(uint32_t dip,uint16_t dport,uint8_
 
         pthread_mutex_t blank_mutex = PTHREAD_MUTEX_INITIALIZER;
         rte_memcpy(&host->mutex, &blank_mutex, sizeof(pthread_mutex_t));
-
         LL_ADD(host,lhost);
+        }
+
+        else if(type==SOCK_STREAM){
+            struct ng_tcp_stream*stream=rte_malloc("ng_tcp_stream",sizeof(struct ng_tcp_stream),0);
+            memset(stream,0,sizeof(struct ng_tcp_stream));
+            if(stream==NULL){
+            return -1;
+            }
+            stream->fd=fd;
+            stream->protocol=IPPROTO_TCP;
+            stream->next = stream->prev = NULL;
+            struct ng_tcp_table*table=ng_tcp_table_instance();
+            LL_ADD(stream,table->tcb_set);
+        }
         return fd;
     }
 
     static int nbind(int sockfd,const struct sockaddr *addr,socklen_t addrlen){
-        struct localhost*host=gethostinfo_from_fd(sockfd);
-        if(host==NULL)
-        return -1;
-        struct sockaddr_in*localaddr=(struct sockaddr_in*)addr;
-        //struct sockaddr 没有 sin_port、`sin_addr` 这些 IPv4 专用成员
-        //把通用地址指针 addr 转换成 IPv4 地址结构体指针，方便访问 IP 和端口
+        struct void*hostinfo = gethostinfo_from_fd(sockfd);
+        if(hostinfo==NULL)
+            return -1;
+        struct localhost*host=(struct localhost*)hostinfo;
+        if(host->protocol == IPPROTO_UDP){
+            struct sockaddr_in*localaddr=(struct sockaddr_in*)addr;
+            //struct sockaddr 没有 sin_port、`sin_addr` 这些 IPv4 专用成员
+            //把通用地址指针 addr 转换成 IPv4 地址结构体指针，方便访问 IP 和端口
 
-        host->localport=localaddr->sin_port;
-        rte_memcpy(host->localmac,smac,RTE_ETHER_ADDR_LEN);
-        rte_memcpy(host->localip,&localaddr->sin_addr.s_addr,sizeof(uint32_t));
+            host->localport=localaddr->sin_port;
+            rte_memcpy(host->localmac,smac,RTE_ETHER_ADDR_LEN);
+            rte_memcpy(host->localip,&localaddr->sin_addr.s_addr,sizeof(uint32_t));
+        }
+        else if(host->protocol == IPPROTO_TCP){
+            struct ng_tcp_stream *stream = (struct ng_tcp_stream *)hostinfo;
+		
+            const struct sockaddr_in *laddr = (const struct sockaddr_in *)addr;
+            stream->dport = laddr->sin_port;
+            rte_memcpy(&stream->dip, &laddr->sin_addr.s_addr, sizeof(uint32_t));
+            rte_memcpy(stream->localmac, gSrcMac, RTE_ETHER_ADDR_LEN);
+
+            stream->status = NG_TCP_STATUS_CLOSED;
+
+        }
         return 0;
     }
+
+    static int nlisten(int sockfd, __attribute__((unused)) int backlog) { //
+
+	void *hostinfo =  get_hostinfo_fromfd(sockfd);
+	if (hostinfo == NULL) return -1;
+
+	
+	struct ng_tcp_stream *stream = (struct ng_tcp_stream *)hostinfo;
+	if (stream->protocol == IPPROTO_TCP) {
+		stream->status = NG_TCP_STATUS_LISTEN;
+	}
+
+	return 0;
+}
 
     static int nclose(int sockfd){
         struct localhost*host=gethostinfo_from_fd(sockfd);
@@ -858,6 +902,9 @@ struct ng_tcp_stream{
 
 	struct ng_tcp_stream *prev;
 	struct ng_tcp_stream *next;
+
+    pthread_mutex_t mutex;
+    pthread_cond_t cond;
 }
 
 struct ng_tcp_table{
@@ -1194,6 +1241,41 @@ static int ng_tcp_out(struct rte_mempool*mbuf_pool){
 
         }
     }
+}
+
+int tcp_server_entry(int argc,char*argv[]){
+    int listenfd=nsocket(AF_INET,SOCK_STREAM,0);
+    if(listenfd<0)
+    return -1;
+
+    struct sockaddr_in serveraddr;
+    memset(serveraddr,0,sizeof(serveraddr));
+    serveraddr.sin_family=AF_INET;
+    serveraddr.sin_port=htons(9999);
+    serveraddr.sin_addr.s_addr=htonl(INADDR_ANY);
+
+    bind()(listenfd,(struct sockaddr*)&serveraddr,sizeof(struct sockaddr_in));
+    nlisten(listenfd,10);
+
+    while(1){
+        struct sockaddr_in clientaddr;
+        socklen_t clientaddr_len=sizeof(clientaddr);
+        int connfd=accept(listenfd,(struct sockaddr*)&clientaddr,&clientaddr_len);
+        char buff[BUFFER_SIZE] = {0};
+        while(1){
+            int n = nrecvfrom(connfd, buff, BUFFER_SIZE, 0, (struct sockaddr*)&clientaddr, &clientaddr_len);
+            if(n>0){
+                nsend(connfd, buff, n, 0, (struct sockaddr*)&clientaddr, clientaddr_len);
+            }
+            else if(n==0){
+                nclose(connfd);
+            }
+            else{
+                perror("recv error");
+                break;
+            }
+        }
+        nclose(listenfd);
 }
 
 int main(int argc,char *argv[])
