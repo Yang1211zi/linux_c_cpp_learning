@@ -682,16 +682,55 @@ static int set_fd_frombitmap(int fd) {
 }
 
     static int nclose(int sockfd){
-        struct localhost*host=gethostinfo_from_fd(sockfd);
+        void*host=gethostinfo_from_fd(sockfd);
+        struct localhost*host=(struct localhost*)host;
         if(host==NULL){
             return -1;
         }
+        if(host->protocol==IPPROTO_UDP){
         LL_REMOVE(host,lhost);
         if(host->rbuf)
             rte_ring_free(host->rbuf);
         if(host->sbuf)
             rte_ring_free(host->sbuf);  
         rte_free(host);
+    }
+struct ng_tcp_stream *stream=(struct ng_tcp_stream *)host;
+    if(stream->protocol==IPPROTO_TCP){
+        if (stream->status != NG_TCP_STATUS_LISTEN) {
+			
+			struct ng_tcp_fragment *fragment = rte_malloc("ng_tcp_fragment", sizeof(struct ng_tcp_fragment), 0);
+			if (fragment == NULL) return -1;
+
+			printf("nclose --> enter last ack\n");
+			fragment->data = NULL;
+			fragment->length = 0;
+			fragment->sport = stream->dport;
+			fragment->dport = stream->sport;
+
+			fragment->seqnum = stream->snd_nxt;
+			fragment->acknum = stream->rcv_nxt;
+
+			fragment->tcp_flags = RTE_TCP_FIN_FLAG | RTE_TCP_ACK_FLAG;
+			fragment->windows = TCP_INITIAL_WINDOW;
+			fragment->hdrlen_off = 0x50;
+
+			rte_ring_mp_enqueue(stream->sndbuf, fragment);
+			stream->status = NG_TCP_STATUS_LAST_ACK;
+
+			
+			set_fd_frombitmap(fd);
+
+		} else { // nsocket
+
+			struct ng_tcp_table *table = tcpInstance();
+			LL_REMOVE(stream, table->tcb_set);	
+
+			rte_free(stream);
+
+		}
+
+    }
         return 0;
     }
 
@@ -1116,9 +1155,25 @@ static struct rte_mbuf * ng_tcp_pkt(struct rte_mempool *mbuf_pool, uint32_t sip,
 static int ng_tcp_handle_syn_rcvd(struct ng_tcp_stream *stream, struct rte_tcp_hdr *tcphdr){
     if(tcphdr->tcp_flags & RTE_TCP_ACK_FLAG){
         if(stream->status ==NG_TCP_STATUS_SYN_RCVD){
+            uint32_t acknum = ntohl(tcphdr->recv_ack);
+			if (acknum == stream->snd_nxt + 1) {
+				// 
+			}
 
-        }
+
         stream->status = NG_TCP_STATUS_ESTABLISHED;
+
+        struct ng_tcp_stream *listener = ng_tcp_stream_search(0, 0, 0, stream->dport);
+			if (listener == NULL) {
+				rte_exit(EXIT_FAILURE, "ng_tcp_stream_search failed\n");
+			}
+
+			pthread_mutex_lock(&listener->mutex);
+			pthread_cond_signal(&listener->cond);
+			pthread_mutex_unlock(&listener->mutex);
+        }
+        
+
     }
     return 0;
 }
@@ -1154,9 +1209,147 @@ static ssize_t ng_tcp_accept(int sockfd, struct sockaddr *addr, socklen_t *addrl
     return -1;
 }
 
+ssize_t send(int sockfd, const void *buf, size_t len, int flags) {
+    struct ng_tcp_stream *stream = (struct ng_tcp_stream *)get_hostinfo_from_fd(sockfd);
+    if (stream == NULL) return -1;
+
+    if(stream->protocol == IPPROTO_TCP){
+        struct ng_tcp_fragment *fragment = rte_malloc("ng_tcp_fragment", sizeof(struct ng_tcp_fragment), 0);
+        if(fragment==NULL)
+            return -1;
+        memset(fragment,0,sizeof(struct ng_tcp_fragment));
+        fragment->sport = stream->sport;
+        fragment->dport = stream->dport;
+        fragment->seqnum = stream->snd_nxt;
+        fragment->acknum = stream->rcv_nxt;
+        fragment->tcp_flags = RTE_TCP_ACK_FLAG | RTE_TCP_PSH_FLAG;
+        fragment->windows = TCP_INITIAL_WINDOW;
+        fragment->hdrlen_off = 0x50;
+        fragment->data=rte_malloc("unsigned char*",len+1,0);
+        if(fragment->data==NULL){
+            rte_free(fragment);
+            return -2;
+        }
+        memset(fragment->data,0,len+1);
+        rte_memcpy(fragment->data,buf,len);
+        fragment->length=len;
+
+        rte_ring_mp_enqueue(stream->sndbuf,fragment);
+
+        return len;
+    }
+    return -1;
+}
+
+ssize_t recv(int sockfd, void *buf, size_t len, int flags) {
+    struct ng_tcp_stream *stream = (struct ng_tcp_stream *)get_hostinfo_from_fd(sockfd);
+    if (stream == NULL) return -1;
+
+    if(stream->protocol == IPPROTO_TCP){
+        struct ng_tcp_fragment *fragment=NULL;
+        int nb=-1;
+        pthread_mutex_lock(&stream->mutex);
+        while((nb=rte_ring_mc_dequeue(stream->rcvbuf, (void **)&fragment))<0){
+            pthread_cond_wait(&stream->cond,&stream->mutex);
+        }
+        pthread_mutex_unlock(&stream->mutex);
+
+        if(fragment->length>len){
+            rte_memcpy(buf,fragment->data,len);
+            uint8_t *ptr=rte_malloc("unsigned char*",fragment->length-len,0);
+            rte_memcpy(ptr,fragment->data+len,fragment->length-len);
+
+            rte_free(fragment->data);
+            fragment->data=ptr;
+            fragment->length=fragment->length-len;
+            rte_ring_mp_enqueue(stream->rcvbuf,fragment);
+            return len;
+        }
+        else if(fragment->length==0){
+            rte_free(fragment);
+            return 0;
+        }
+        else{
+            rte_memcpy(buf,fragment->data,fragment->length);
+            rte_free(fragment->data);
+            rte_free(fragment);
+            return fragment->length;
+        }
+    }
+    return -1;
+}
+
+static int ng_tcp_enqueue_recvbuffer(struct ng_tcp_stream *stream, struct rte_tcp_hdr *tcphdr, int tcplen){
+    struct ng_tcp_fragment * rfragment = rte_malloc("ng_tcp_fragment", sizeof(struct ng_tcp_fragment), 0);
+    if(rfragment==NULL)
+    return -1;
+    memset(rfragment,0,sizeof(struct ng_tcp_fragment));
+    rfragment->sport = tcphdr->src_port;
+    rfragment->dport = tcphdr->dst_port;
+    uint8_t hdrlen = tcphdr->data_off >> 4;
+    int payload_len = tcplen-hdrlen*4;
+    if(payload_len>0){
+        rfragment->data=rte_malloc("unsigned char*",payload_len+1,0);
+        if(rfragment->data==NULL){
+            rte_free(rfragment);
+            return -2;
+        }
+        memset(rfragment->data,0,payload_len+1);
+        uint8_t *payload = (uint8_t*)tcphdr+hdrlen*4;
+        rte_memcpy(rfragment->data,payload,payload_len);
+        rfragment->length=payload_len;
+    }
+    else if(payload_len == 0){
+        rfragment->data=NULL;
+        rfragment->length=0;
+    }
+    rte_ring_mp_enqueue(stream->rcvbuf,rfragment);
+    return 0;
+} 
+
+static int ng_tcp_send_ackpkt(struct ng_tcp_stream *stream, struct rte_tcp_hdr *tcphdr){
+    struct ng_tcp_fragment * ackfrag = rte_malloc("ng_tcp_fragment", sizeof(struct ng_tcp_fragment), 0);
+    if(ackfrag==NULL){
+        rte_free(rfragment);
+        return -3;
+    }
+    memset(ackfrag, 0, sizeof(struct ng_tcp_fragment));
+    ackfrag->dport = tcphdr->src_port;
+	ackfrag->sport = tcphdr->dst_port;
+    stream->rcv_nxt = stream->rcv_nxt + payloadlen;
+    // local 
+    stream->snd_nxt = ntohl(tcphdr->recv_ack);
+    //ackfrag->
+
+    ackfrag->acknum = stream->rcv_nxt;
+    ackfrag->seqnum = stream->snd_nxt;
+
+    ackfrag->tcp_flags = RTE_TCP_ACK_FLAG;
+    ackfrag->windows = TCP_INITIAL_WINDOW;
+    ackfrag->hdrlen_off = 0x50;
+    ackfrag->data = NULL;
+    ackfrag->length = 0;
+    
+    pthread_mutex_lock(&stream->mutex);
+
+    int ret = rte_ring_mp_enqueue(stream->rcvbuf, rfragment);
+    if (ret == 0) {
+        pthread_cond_signal(&stream->cond);
+    }
+
+    pthread_mutex_unlock(&stream->mutex);
+
+    if (ret != 0) {
+        rte_free(rfragment->data);
+        rte_free(rfragment);
+        return -1;
+    }
+}
+
 static int ng_tcp_handle_established(struct ng_tcp_stream *stream, struct rte_tcp_hdr *tcphdr, int tcplen) {
     if (tcphdr->tcp_flags & RTE_TCP_PSH_FLAG){
     //recv buffer
+    #if 0
     struct ng_tcp_fragment * rfragment = rte_malloc("ng_tcp_fragment", sizeof(struct ng_tcp_fragment), 0);
     if(rfragment==NULL)
     return -1;
@@ -1177,7 +1370,11 @@ static int ng_tcp_handle_established(struct ng_tcp_stream *stream, struct rte_tc
         rfragment->length=payload_len;
     }
     rte_ring_mp_enqueue(stream->rcvbuf,rfragment);
+    #else if
+    ng_tcp_enqueue_recvbuffer(stream, tcphdr, tcplen);
+#endif
 
+#if 0
     //ack ptk
     struct ng_tcp_fragment * ackfrag = rte_malloc("ng_tcp_fragment", sizeof(struct ng_tcp_fragment), 0);
     if(ackfrag==NULL){
@@ -1201,7 +1398,29 @@ static int ng_tcp_handle_established(struct ng_tcp_stream *stream, struct rte_tc
     ackfrag->data = NULL;
     ackfrag->length = 0;
     
-    rte_ring_mp_enqueue(stream->sndbuf, ackfrag);
+    pthread_mutex_lock(&stream->mutex);
+
+    int ret = rte_ring_mp_enqueue(stream->rcvbuf, rfragment);
+    if (ret == 0) {
+        pthread_cond_signal(&stream->cond);
+    }
+
+    pthread_mutex_unlock(&stream->mutex);
+
+    if (ret != 0) {
+        rte_free(rfragment->data);
+        rte_free(rfragment);
+        return -1;
+    }
+    #else if
+      uint8_t hdrlen = tcphdr->data_off >> 4;
+		int payloadlen = tcplen - hdrlen * 4;
+		
+		stream->rcv_nxt = stream->rcv_nxt + payloadlen;
+		stream->snd_nxt = ntohl(tcphdr->recv_ack);
+
+        ng_tcp_send_ackpkt(stream, tcphdr);
+    #endif
 
     //echo ptk
     struct ng_tcp_fragment * echofrag = rte_malloc("ng_tcp_fragment", sizeof(struct ng_tcp_fragment), 0);
@@ -1233,6 +1452,10 @@ static int ng_tcp_handle_established(struct ng_tcp_stream *stream, struct rte_tc
     }
 
     return 0;
+}
+
+static int ng_tcp_handle_close_wait(struct ng_tcp_stream *stream, struct rte_tcp_hdr *tcphdr){
+
 }
 
 static int ng_tcp_process(struct rte_mbuf *mbufs){
