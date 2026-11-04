@@ -547,11 +547,29 @@ static struct localhost* gethost_from_ip_port(uint32_t dip,uint16_t dport,uint8_
 
 #if ENABLE_UDP_APP
 #define DEFAULTY_FD 3
-    static int get_fd_from_bitmap(void)
-    {
-        int fd = DEFAULTY_FD;
-        return fd;
-    }
+    static int get_fd_frombitmap(void) {
+
+	int fd = DEFAULT_FD_NUM;
+	for ( ;fd < MAX_FD_COUNT;fd ++) {
+		if ((fd_table[fd/8] & (0x1 << (fd % 8))) == 0) {
+			fd_table[fd/8] |= (0x1 << (fd % 8));
+			return fd;
+		}
+	}
+
+	return -1;
+	
+}
+
+static int set_fd_frombitmap(int fd) {
+
+	if (fd >= MAX_FD_COUNT) return -1;
+
+	fd_table[fd/8] &= ~(0x1 << (fd % 8));
+
+	return 0;
+}
+
 
     static void* gethostinfo_from_fd(int fd){
         struct localhost*host;
@@ -608,6 +626,13 @@ static struct localhost* gethost_from_ip_port(uint32_t dip,uint16_t dport,uint8_
             stream->fd=fd;
             stream->protocol=IPPROTO_TCP;
             stream->next = stream->prev = NULL;
+
+            pthread_cond_t blank_cond = PTHREAD_COND_INITIALIZER;
+            rte_memcpy(&stream->cond, &blank_cond, sizeof(pthread_cond_t));
+
+            pthread_mutex_t blank_mutex = PTHREAD_MUTEX_INITIALIZER;
+            rte_memcpy(&stream->mutex, &blank_mutex, sizeof(pthread_mutex_t));
+
             struct ng_tcp_table*table=ng_tcp_table_instance();
             LL_ADD(stream,table->tcb_set);
         }
@@ -948,6 +973,13 @@ static struct ng_tcp_stream* ng_tcp_stream_search(uint32_t sip,uint32_t dip,uint
             return item;
         }
     }
+
+    for(item=table->tcb_set;item!=NULL;item=item->next){
+        if(item->dport==dport && item->status==NG_TCP_STATUS_LISTEN){
+            return item;
+        }
+    }
+
     return NULL;
 }
 
@@ -965,39 +997,50 @@ static struct ng_tcp_stream* ng_tcp_stream_create(uint32_t sip,uint32_t dip,uint
     stream->status=NG_TCP_STATUS_LISTEN;
     stream->sndbuf=rte_ring_create("sndbuf",RING_SIZE,rte_socket_id(),0);
     stream->rcvbuf=rte_ring_create("rcvbuf",RING_SIZE,rte_socket_id(),0);
+    stream->fd=-1;
 
     rte_memcpy(stream->localmac,smac,RTE_ETHER_ADDR_LEN);
 
     uint32_t next_seed = time(NULL);
 	stream->snd_nxt = rand_r(&next_seed) % TCP_MAX_SEQ;
     
+    pthread_cond_t blank_cond = PTHREAD_COND_INITIALIZER;
+	rte_memcpy(&stream->cond, &blank_cond, sizeof(pthread_cond_t));
+
+	pthread_mutex_t blank_mutex = PTHREAD_MUTEX_INITIALIZER;
+	rte_memcpy(&stream->mutex, &blank_mutex, sizeof(pthread_mutex_t));
+
     struct ng_tcp_table *table = tcpInstance();
 	LL_ADD(stream, table->tcb_set);
 
     return stream;
 }
 
-static int ng_tcp_handle_listen(struct ng_tcp_stream *stream, struct rte_tcp_hdr *tcphdr) {
+static int ng_tcp_handle_listen(struct ng_tcp_stream *stream, struct rte_tcp_hdr *tcphdr, struct rte_ipv4_hdr *iphdr) {
     if (tcphdr->tcp_flags & RTE_TCP_SYN_FLAG) {
         if(stream->status == NG_TCP_STATUS_LISTEN){
+
+            struct ng_tcp_stream *syn = ng_tcp_stream_create(iphdr->dst_addr, iphdr->src_addr, tcphdr->dst_port, tcphdr->src_port);
+            if(syn==NULL)
+                return -1;
             struct ng_tcp_fragment *fragment = rte_malloc("ng_tcp_fragment", sizeof(struct ng_tcp_fragment), 0);
             if(fragment==NULL)
-            return -1;
+            return -2;
         memset(fragment,0,sizeof(struct ng_tcp_fragment));
 
         fragment->sport = tcphdr->dst_port;
         fragment->dport = tcphdr->src_port;
         fragment->seqnum = stream->snd_nxt;
         fragment->acknum = ntohl(tcphdr->sent_seq) + 1;
-        stream->rcv_nxt = fragment->acknum;
+        syn->rcv_nxt = fragment->acknum;
         fragment->tcp_flags = RTE_TCP_SYN_FLAG | RTE_TCP_ACK_FLAG;
         fragment->windows = TCP_INITIAL_WINDOW;
         fragment->hdrlen_off = 0x50;
         fragment->data=NULL;
 
-        rte_ring_mp_enqueue(stream->sndbuf,fragment);
+        rte_ring_mp_enqueue(syn->sndbuf,fragment);
 
-        stream->status = NG_TCP_STATUS_SYN_RCVD;
+        syn->status = NG_TCP_STATUS_SYN_RCVD;
 
         return 0;
         }
@@ -1078,6 +1121,37 @@ static int ng_tcp_handle_syn_rcvd(struct ng_tcp_stream *stream, struct rte_tcp_h
         stream->status = NG_TCP_STATUS_ESTABLISHED;
     }
     return 0;
+}
+
+struct ng_tcp_stream*get_apt_tcb(int dport){
+    struct ng_tcp_stream*stream;
+    static ng_tcp_table *table=tcpInstance();
+    for(stream=table->tcb_set;stream!=NULL;stream=stream->next){
+        if(stream->dport==dport && stream->status==NG_TCP_STATUS_LISTEN){
+            return stream;
+        }
+    }
+    return NULL;
+}
+
+static ssize_t ng_tcp_accept(int sockfd, struct sockaddr *addr, socklen_t *addrlen) {
+    struct ng_tcp_stream *stream = (struct ng_tcp_stream *)get_hostinfo_from_fd(sockfd);
+    if (stream == NULL) return -1;
+
+    if(stream->protocol == IPPROTO_TCP){
+        struct ng_tcp_stream *apt=NULL;
+        pthread_mutex_lock(&stream->mutex);
+        while((apt=get_apt_tcb(stream->dport))==NULL){
+            pthread_cond_wait(&stream->cond,&stream->mutex);
+        }
+        pthread_mutex_unlock(&stream->mutex);
+        apt->fd = get_fd_frombitmap();
+        struct sockaddr_in *client_addr = (struct sockaddr_in *)addr;
+        client_addr->sin_port = apt->sport;
+        rte_memcpy(&client_addr->sin_addr.s_addr, &apt->sip, sizeof(uint32_t));
+        return apt->fd;
+    }
+    return -1;
 }
 
 static int ng_tcp_handle_established(struct ng_tcp_stream *stream, struct rte_tcp_hdr *tcphdr, int tcplen) {
@@ -1174,17 +1248,16 @@ static int ng_tcp_process(struct rte_mbuf *mbufs){
 
     struct tcp_stream* tcp_stream=ng_tcp_stream_search(iphdr->src_addr,iphdr->dst_addr,tcphdr->src_port,tcphdr->dst_port);
     if(tcp_stream==NULL){
-        tcp_stream = ng_tcp_stream_create(iphdr->src_addr,iphdr->dst_addr,tcphdr->src_port,tcphdr->dst_port);
-        if(tcp_stream==NULL)
         return -2;
     }
+
     switch (tcp_stream->status) {
 
 		case NG_TCP_STATUS_CLOSED: //client 
 			break;
 			
 		case NG_TCP_STATUS_LISTEN: // server
-			ng_tcp_handle_listen(tcp_stream, tcphdr);
+			ng_tcp_handle_listen(tcp_stream, tcphdr, iphdr);
 			break;
 
 		case NG_TCP_STATUS_SYN_RCVD: // server
