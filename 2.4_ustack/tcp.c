@@ -1049,8 +1049,8 @@ static struct ng_tcp_stream* ng_tcp_stream_create(uint32_t sip,uint32_t dip,uint
 	pthread_mutex_t blank_mutex = PTHREAD_MUTEX_INITIALIZER;
 	rte_memcpy(&stream->mutex, &blank_mutex, sizeof(pthread_mutex_t));
 
-    struct ng_tcp_table *table = tcpInstance();
-	LL_ADD(stream, table->tcb_set);
+    //struct ng_tcp_table *table = tcpInstance();
+	//LL_ADD(stream, table->tcb_set);
 
     return stream;
 }
@@ -1182,7 +1182,7 @@ struct ng_tcp_stream*get_apt_tcb(int dport){
     struct ng_tcp_stream*stream;
     static ng_tcp_table *table=tcpInstance();
     for(stream=table->tcb_set;stream!=NULL;stream=stream->next){
-        if(stream->dport==dport && stream->status==NG_TCP_STATUS_LISTEN){
+        if(stream->dport==dport && stream->status==NG_TCP_STATUS_ESTABLISHED && stream->fd==-1){
             return stream;
         }
     }
@@ -1347,6 +1347,9 @@ static int ng_tcp_send_ackpkt(struct ng_tcp_stream *stream, struct rte_tcp_hdr *
 }
 
 static int ng_tcp_handle_established(struct ng_tcp_stream *stream, struct rte_tcp_hdr *tcphdr, int tcplen) {
+    if(tcphdr->tcp_flags & RTE_TCP_SYN_FLAG){
+
+    }
     if (tcphdr->tcp_flags & RTE_TCP_PSH_FLAG){
     //recv buffer
     #if 0
@@ -1451,11 +1454,47 @@ static int ng_tcp_handle_established(struct ng_tcp_stream *stream, struct rte_tc
     rte_ring_mp_enqueue(stream->sndbuf,echofrag);
     }
 
+    if(tcphdr->tcp_flags & RTE_TCP_ACK_FLAG){
+
+    }
+
+    if(tcphdr->tcp_flags & RTE_TCP_FIN_FLAG){
+       stream->status = NG_TCP_STATUS_CLOSE_WAIT;
+
+        ng_tcp_enqueue_recvbuffer(stream, tcphdr, tcphdr->data_off >> 4);
+
+        // send ack pkt
+        stream->rcv_nxt = stream->rcv_nxt + 1;
+        stream->snd_nxt = ntohl(tcphdr->recv_ack);
+
+        ng_tcp_send_ackpkt(stream, tcphdr);
+    }
+
+
     return 0;
 }
 
 static int ng_tcp_handle_close_wait(struct ng_tcp_stream *stream, struct rte_tcp_hdr *tcphdr){
+    if(tcphdr->tcp_flags & RTE_TCP_FIN_FLAG){
+        if(stream->status == NG_TCP_STATUS_CLOSE_WAIT){
+            
+        }
+    }
+   return 0;
+}
 
+static int ng_tcp_handle_last_ack(struct ng_tcp_stream *stream, struct rte_tcp_hdr *tcphdr){
+    if(tcphdr->status == NG_TCP_STATUS_ACK_FLAG){
+        if(stream->status == NG_TCP_STATUS_LAST_ACK){
+            stream->status = NG_TCP_STATUS_CLOSED;
+            struct ng_tcp_table *table = tcpInstance();
+            LL_REMOVE(stream, table->tcb_set);
+            rte_ring_free(stream->sndbuf);
+			rte_ring_free(stream->rcvbuf);
+            rte_free(stream);
+        }
+    }
+    return 0;
 }
 
 static int ng_tcp_process(struct rte_mbuf *mbufs){
@@ -1491,6 +1530,8 @@ static int ng_tcp_process(struct rte_mbuf *mbufs){
 			break;
 
 		case NG_TCP_STATUS_ESTABLISHED: // server | client
+            ng_tcp_handle_established(tcp_stream, tcphdr, iphdr);
+            break;
 
         case NG_TCP_STATUS_FIN_WAIT_1: //  ~client
 			break;
@@ -1505,9 +1546,11 @@ static int ng_tcp_process(struct rte_mbuf *mbufs){
 			break;
 
 		case NG_TCP_STATUS_CLOSE_WAIT: // ~server
+            ng_tcp_handle_close_wait(tcp_stream, tcphdr);
 			break;
 			
 		case NG_TCP_STATUS_LAST_ACK:  // ~server
+            ng_tcp_handle_last_ack(tcp_stream, tcphdr);
 			break;
 
 	}
@@ -1521,6 +1564,7 @@ static int ng_tcp_out(struct rte_mempool*mbuf_pool){
     struct ng_tcp_table *table=tcpInstance();
     struct ng_tcp_stream *stream;
     for(stream=table->tcb_set;stream!=NULL;stream=stream->next){
+        if(stream->sndbuf==NULL) continue;
         struct ng_tcp_fragment *fragment=NULL;
         int nb_snd = rte_ring_mc_dequeue(stream->sndbuf, (void**)&fragment);
         if(nb_snd<0) continue;
