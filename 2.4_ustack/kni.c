@@ -91,6 +91,7 @@ static uint8_t gDefaultArpMac[RTE_ETHER_ADDR_LEN] = {
 
         struct arp_entry *entries;
         int count;
+        pthread_spinlock_t spinlock;
 
     };
 
@@ -111,11 +112,13 @@ static uint8_t gDefaultArpMac[RTE_ETHER_ADDR_LEN] = {
     static uint8_t*arp_table_mac_lookup(uint32_t ip){
         arp_entry*item;
         arp_table*table=arp_table_instance();
+        pthread_spin_lock(&table->spinlock);
         for(item=table->entries;item!=NULL;item=item->next){
             if(item->ip==ip){
                 return item->mac;
     } 
     }
+    pthread_spin_unlock(&table->spinlock);
     return NULL;
     }
 
@@ -308,8 +311,10 @@ static int ng_arp_entry_insert(uint32_t ip , uint8_t *mac) {
             entry->ip=ip;
             rte_memcpy(entry->macc,mac,RTE_ETHER_ADDR_LEN);
             entry->status=ARP_ENTRY_STATUS_DYNAMIC;//动态记录通常表示：这条 IP 与 MAC 的对应关系是通过 ARP 通信自动学习得到的
+            pthread_spin_lock(&table->spinlock);
             LL_ADD(entry,table->entries);
             table->count++;
+            pthread_spin_unlock(&table->spinlock);
         }
         return 1;
     }

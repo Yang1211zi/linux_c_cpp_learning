@@ -17,6 +17,7 @@
 #define ENABLE_MULTHREAD 1
 #define ENABLE_UDP_APP 1
 #define ENABLE_TCP_APP 1
+#define ENABLE_EPOLL 1
 #define TCP_WINDOW_SIZE 14600
 #define RING_SIZE 1024
 #define UDP_APP_SIZE 1024
@@ -1582,6 +1583,7 @@ static int ng_tcp_out(struct rte_mempool*mbuf_pool){
     }
 }
 
+
 int tcp_server_entry(int argc,char*argv[]){
     int listenfd=nsocket(AF_INET,SOCK_STREAM,0);
     if(listenfd<0)
@@ -1593,7 +1595,7 @@ int tcp_server_entry(int argc,char*argv[]){
     serveraddr.sin_port=htons(9999);
     serveraddr.sin_addr.s_addr=htonl(INADDR_ANY);
 
-    bind()(listenfd,(struct sockaddr*)&serveraddr,sizeof(struct sockaddr_in));
+    nbind(listenfd,(struct sockaddr*)&serveraddr,sizeof(struct sockaddr_in));
     nlisten(listenfd,10);
 
     while(1){
@@ -1615,6 +1617,7 @@ int tcp_server_entry(int argc,char*argv[]){
             }
         }
         nclose(listenfd);
+    }
 }
 
 int main(int argc,char *argv[])
