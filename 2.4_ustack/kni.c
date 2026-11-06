@@ -1,6 +1,7 @@
 #include<stdio.h>
 #include<rte_eal.h>
 #include<rte_ethdev.h>
+#include<rte_kni.h>
 
 #define NUM_MBUFS 4096
 #define BURST_SIZE 1024
@@ -20,6 +21,10 @@
 #define TCP_WINDOW_SIZE 14600
 #define RING_SIZE 1024
 #define UDP_APP_SIZE 1024
+
+#if ENABLE_KNI_APP
+struct rte_kni *global_kni = NULL;
+#endif
 
 #if ENABLE_SEND
 uint8_t smac[RTE_ETHER_ADDR_LEN];
@@ -293,6 +298,24 @@ static int ustack_encode_tcp_pkt(uint8_t*msg,uint16_t tol_len){
 }
 
 #if ENABLE_ARP
+
+static int ng_arp_entry_insert(uint32_t ip , uint8_t *mac) {
+    struct arp_table*table=arp_table_instance();
+    uint8_t*macc=arp_table_mac_lookup(ip);
+    if(macc==NULL){
+        arp_entry*entry=rte_malloc(NULL,sizeof(arp_entry),0);
+        if(entry){
+            entry->ip=ip;
+            rte_memcpy(entry->macc,mac,RTE_ETHER_ADDR_LEN);
+            entry->status=ARP_ENTRY_STATUS_DYNAMIC;//动态记录通常表示：这条 IP 与 MAC 的对应关系是通过 ARP 通信自动学习得到的
+            LL_ADD(entry,table->entries);
+            table->count++;
+        }
+        return 1;
+    }
+    return 0;
+}
+
 static int ustack_encode_arp_pkt(uint8_t*msg,uint16_t opcode,uint8_t*dmac,uint32_t sip,uint32_t dip){
     //ethhdr header
     struct rte_ether_hdr *ethhdr = (struct rte_ether_hdr *)msg;
@@ -485,6 +508,29 @@ static struct localhost* gethost_from_ip_port(uint32_t dip,uint16_t dport,uint8_
         unsigned int nb_rx = rte_ring_mc_dequeue_burst(ring->in, (void **)bufs, BURST_SIZE, NULL);
         for(int i=0;i<nb_rx;i++){
             struct rte_ether_hdr *ethhdr = rte_pktmbuf_mtod(bufs[i], struct rte_ether_hdr *);
+            if (ethhdr->ether_type == rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4)) {
+				struct rte_ipv4_hdr *iphdr = rte_pktmbuf_mtod_offset(bufs[i], struct rte_ipv4_hdr *, sizeof(struct rte_ether_hdr));
+                
+                #if 1
+                ng_arp_entry_insert(iphdr->src_addr, ethhdr->s_addr.addr_bytes);
+                #endif
+
+			    if (iphdr->next_proto_id == IPPROTO_UDP) {
+                  udp_process(bufs[i]);
+                }
+                else if(iphdr->next_proto_id == IPPROTO_TCP){
+                    ng_tcp_process(bufs[i]);
+                }
+                else{
+                    rte_kni_tx_burst(global_kni, &bufs[i], 1);
+                }
+			}
+            else{
+                rte_kni_tx_burst(global_kni, &bufs[i], 1);
+            }
+
+#if 0
+
             #if ENABLE_ARP
             if(ethhdr->ether_type == rte_cpu_to_be_16(RTE_ETHER_TYPE_ARP)) {
                 struct rte_arp_hdr *arphdr = rte_pktmbuf_mtod_offset(bufs[i], struct rte_arp_hdr *, sizeof(struct rte_ether_hdr));
@@ -537,6 +583,8 @@ static struct localhost* gethost_from_ip_port(uint32_t dip,uint16_t dport,uint8_
                 }
             }
         
+            #endif
+
             #endif
         
                 else if(iphdr->next_proto_id == IPPROTO_TCP) {
@@ -1569,6 +1617,8 @@ static int ng_tcp_process(struct rte_mbuf *mbufs){
     if(cksum != tcp_cksum)
     return -1;
 
+    
+
     struct tcp_stream* tcp_stream=ng_tcp_stream_search(iphdr->src_addr,iphdr->dst_addr,tcphdr->src_port,tcphdr->dst_port);
     if(tcp_stream==NULL){
         return -2;
@@ -1680,14 +1730,56 @@ int tcp_server_entry(int argc,char*argv[]){
 }
 
 #if ENABLE_KNI_APP
+
+static int ng_config_network_if(uint16_t port_id, uint8_t if_up) {
+
+	if (!rte_eth_dev_is_valid_port(port_id)) {
+		return -EINVAL;
+	}
+
+	int ret = 0;
+	if (if_up) {
+
+		rte_eth_dev_stop(port_id);
+		ret = rte_eth_dev_start(port_id);
+
+	} else {
+
+		rte_eth_dev_stop(port_id);
+
+	}
+
+	if (ret < 0) {
+		printf("Failed to start port : %d\n", port_id);
+	}
+
+	return 0;
+}
+
+
+/*
+用来创建一个连接 DPDK 用户态程序和 Linux 内核的 KNI 虚拟网络接口，它负责建立通道，后续由收发函数通过通道传递报文
+*/
 static struct rte_kni* kni_alloc(struct rte_mempool *mbuf_pool){
     struct rte_kni*kni_handler=NULL;
     struct rte_kni_conf conf;
     memset(&conf,0,sizeof(conf));
+    snprintf(conf.name, RTE_KNI_NAMESIZE, "vEth%u", global_port_id);
+    conf.group_id=global_port_id;
+    conf.mbuf_size=RTE_MBUF_DEFAULT_BUF_SIZE;
+    rte_eth_macaddr_get(global_port_id, (struct rte_ether_addr *)conf.mac_addr);
+	rte_eth_dev_get_mtu(global_port_id, &conf.mtu);
+
     struct rte_kni_ops ops;
     memset(&ops,0,sizeof(ops));
+    ops.port_id = global_port_id;
+	ops.config_network_if = ng_config_network_if;
 
     kni_handler=rte_kni_alloc(mbuf_pool,&conf,&ops);
+    if(!kni_handler){
+        rte_exit(EXIT_FAILURE,"rte_kni_alloc error\n");
+    }
+    return kni_handler;
 }
 #endif
 
@@ -1700,14 +1792,19 @@ int main(int argc,char *argv[])
     if(mbuf_pool==NULL){
         rte_exit(EXIT_FAILURE,"Cannot create mbuf pool\n");
     }
+
     #if ENABLE_KNI_APP
     if(rte_kni_init(mbuf_pool) == -1){
         rte_exit(EXIT_FAILURE,"Cannot create kni\n");
     }
-    #endif
+    ustack_init_port(mbuf_pool);
+    kni_alloc(mbuf_pool);
 
+    #else
 
     ustack_init_port(mbuf_pool);
+
+    #endif
 
     arp_table_mac_lookup(gLocalIp);
 
