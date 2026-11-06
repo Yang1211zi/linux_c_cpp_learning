@@ -1160,7 +1160,6 @@ static int ng_tcp_handle_syn_rcvd(struct ng_tcp_stream *stream, struct rte_tcp_h
 				// 
 			}
 
-
         stream->status = NG_TCP_STATUS_ESTABLISHED;
 
         struct ng_tcp_stream *listener = ng_tcp_stream_search(0, 0, 0, stream->dport);
