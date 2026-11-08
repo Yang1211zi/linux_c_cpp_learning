@@ -1,0 +1,47 @@
+#include <net/sock.h>
+#include <linux/socket.h>
+
+/*
+这里的应用场景为网络，每次accept函数执行后（建立新连接后）打印对应内容
+*/
+
+BEGIN
+{
+
+	printf("%8s %6s %16s", "TIME", "PID", "COMM");
+        printf("%19s:%5s  %16s:%5s\n", "SADDR", "SPORT", "DADDR", "DPORT");
+}
+
+kretprobe:inet_csk_accept 
+{
+	$sk = (struct sock*)retval;
+
+	$inet_family = $sk->__sk_common.skc_family;
+
+        if ($inet_family == AF_INET) {
+
+                $daddr = ntop($sk->__sk_common.skc_daddr);
+                $saddr = ntop($sk->__sk_common.skc_rcv_saddr);
+
+        }
+
+        $dport = $sk->__sk_common.skc_dport;
+        $lport = $sk->__sk_common.skc_num;
+
+        $dport = bswap($dport);
+
+        /*
+        comm、pid 这些不是你自己随意命名的变量，它们是 bpftrace 工具自身定义的内置变量（Builtins）。
+        你可以把 bpftrace 理解成一种专门用于追踪的“编程语言”，comm、pid 这些就是它的“关键字”或“系统函数”，名字是固定的，不能自己乱改。
+        */
+        time("%H:%M:%S ");
+        printf("%6d %16s", pid, comm);
+        printf("%19s:%5d  %16s:%5d\n", $saddr, $lport, $daddr, $dport);	
+
+}
+
+END
+{
+	printf("END\n");
+}
+

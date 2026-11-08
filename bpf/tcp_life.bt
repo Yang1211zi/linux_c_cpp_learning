@@ -1,0 +1,59 @@
+#include <net/sock.h>
+#include <linux/socket.h>
+
+/*
+BEGIN 是一个特殊的探针（Probe）。它不挂载到任何内核函数、系统调用或硬件事件上。它只对“bpftrace 程序开始运行”这个动作本身做出反应。
+BEGIN{} 里的内容会在脚本启动时最先执行，而且只执行一次,后续的触发不会在调用begin中的内容
+用途：通常用来做初始化工作或打印表头
+*/
+BEGIN
+{
+	printf("%8s %6s %16s", "TIME", "PID", "COMM");
+        printf("%19s:%5s  %16s:%5s %s\n", "SADDR", "SPORT", "DADDR", "DPORT", "DURms");
+}
+
+kprobe:tcp_set_state
+{
+	$sk = (struct sock*)arg0;
+	$newstate = arg1;
+
+	if ($newstate <= TCP_SYN_RECV) { // begin
+		@birth[$sk] = nsecs;
+	}
+
+	if ($newstate == TCP_CLOSE ) { // end
+		$dur = (nsecs - @birth[$sk]) / 1e6;
+		$inet_family = $sk->__sk_common.skc_family;
+
+        	if ($inet_family == AF_INET) {
+
+                	$daddr = ntop($sk->__sk_common.skc_daddr);
+                	$saddr = ntop($sk->__sk_common.skc_rcv_saddr);
+
+        	}
+
+        	$dport = $sk->__sk_common.skc_dport;
+        	$lport = $sk->__sk_common.skc_num;
+
+        	$dport = bswap($dport);
+
+        	time("%H:%M:%S ");
+        	printf("%6d %16s", pid, comm);
+        	printf("%19s:%5d  %16s:%5d %d\n", $saddr, $lport, $daddr, $dport, $dur);	
+		
+	}
+	
+
+}
+
+/*
+当你按下 Ctrl+C 停止脚本，或者脚本因为超时等条件退出时，执行最后一次
+用途：通常用来打印统计汇总、释放资源或输出结束语
+*/
+END
+{
+	printf("END\n");
+}
+
+
+
