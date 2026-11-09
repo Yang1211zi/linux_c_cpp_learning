@@ -2,6 +2,11 @@
 #include<rte_eal.h>
 #include<rte_ethdev.h>
 #include "arp.h"
+#include <rte_eal.h>
+#include <rte_ethdev.h>
+#include <rte_malloc.h>
+#include <rte_ip.h>
+#include <rte_timer.h>
 
 #define NUM_MBUFS 4096
 #define BURST_SIZE 1024
@@ -132,7 +137,7 @@ static uint8_t gDefaultArpMac[RTE_ETHER_ADDR_LEN] = {
    struct inout_ring{
     struct rte_ring *in;
     struct rte_ring *out;
-   }
+   };
 
    static struct inout_ring*rinst=NULL;
    static struct inout_ring*rinstance(void){
@@ -163,7 +168,7 @@ static uint8_t gDefaultArpMac[RTE_ETHER_ADDR_LEN] = {
         pthread_cond_t cond;
 	    pthread_mutex_t mutex;
 
-    }
+    };
 
     struct localhost*lhost=NULL;//loaclhost链表的头指针,每个连接对应一个localhost节点
 
@@ -274,7 +279,7 @@ static int ustack_encode_udp_pkt(uint8_t*msg,uint8_t*data,uint16_t tol_len){
     ip->src_addr=sip;
     ip->next_proto_id = IPPROTO_UDP;
     ip->hdr_checksum = 0;
-    ip->hdr_checksum=rte_hdr_cksum(ip);
+    ip->hdr_checksum=rte_ipv4_cksum(ip);
     //UDP header
     struct rte_udp_hdr *udp = (struct rte_udp_hdr *)(ip + 1);
     udp->src_port=sport;
@@ -282,7 +287,9 @@ static int ustack_encode_udp_pkt(uint8_t*msg,uint8_t*data,uint16_t tol_len){
     udp->dgram_len=htons(tol_len - sizeof(struct rte_ether_hdr) - sizeof(struct rte_ipv4_hdr));
     udp->dgram_cksum=0;
     udp->dgram_cksum=rte_ipv4_udptcp_cksum(ip,udp);
-    rte_memcpy((uint8_t)(udp+1),data,udp->dgram_len);
+    size_t payload_len = ntohs(udp->dgram_len) - sizeof(*udp);
+    rte_memcpy(udp + 1, data, payload_len);
+    return 0;
 }
 
 static int ustack_encode_tcp_pkt(uint8_t*msg,uint16_t tol_len){
@@ -317,6 +324,7 @@ static int ustack_encode_tcp_pkt(uint8_t*msg,uint16_t tol_len){
     tcp->cksum=0;
     tcp->cksum=rte_ipv4_udptcp_cksum(ip,tcp);
     tcp->tcp_urp=0;
+    return 0;
 }
 
 #if ENABLE_ARP
@@ -328,11 +336,11 @@ static int ustack_encode_arp_pkt(uint8_t*msg,uint16_t opcode,uint8_t*dmac,uint32
     ethhdr->ether_type = rte_cpu_to_be_16(RTE_ETHER_TYPE_ARP);
     //ARP header
     struct rte_arp_hdr *arphdr = (struct rte_arp_hdr *)(ethhdr + 1);
-    arphdr->arp_hrd = rte_cpu_to_be_16(RTE_ARP_HRD_ETHER);
-    arphdr->arp_pro = rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4);
-    arphdr->arp_hln = RTE_ETHER_ADDR_LEN;
-    arphdr->arp_pln = sizeof(uint32_t);
-    arphdr->arp_op = rte_cpu_to_be_16(opcode);
+    arphdr->arp_hardware = rte_cpu_to_be_16(RTE_ARP_HRD_ETHER);
+    arphdr->arp_protocol = rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4);
+    arphdr->arp_hlen = RTE_ETHER_ADDR_LEN;
+    arphdr->arp_plen = sizeof(uint32_t);
+    arphdr->arp_opcode = rte_cpu_to_be_16(opcode);
     rte_memcpy(arphdr->arp_data.arp_sha.addr_bytes, smac, RTE_ETHER_ADDR_LEN);
     arphdr->arp_data.arp_sip = sip;
     rte_memcpy(arphdr->arp_data.arp_tha.addr_bytes, dmac, RTE_ETHER_ADDR_LEN);
@@ -348,7 +356,7 @@ static struct rte_mbuf*ng_send_arp(struct rte_mempool *mbuf_pool,uint16_t opcode
     m->data_len=sizeof(struct rte_ether_hdr)+sizeof(struct rte_arp_hdr);
     m->pkt_len=sizeof(struct rte_ether_hdr)+sizeof(struct rte_arp_hdr);
     uint8_t*msg=rte_pktmbuf_mtod(m,uint8_t*);
-    ustack_encode_arp_pkt(msg, opcode, smac, dmac, sip, dip);
+    ustack_encode_arp_pkt(msg, opcode, dmac, sip, dip);
     return m;
 }
 #endif
@@ -399,7 +407,7 @@ static int ustack_encode_icmp_pkt(uint8_t*msg,uint8_t*dmac,uint32_t sip,uint32_t
     return 0;
 }
 
-static struct rte_mbuf*ng_send_icmp(struct rte_mempool *mbuf_pool,uint8_t dmac,uint32_t dip,uint32_t sip,uint16_t id,uint16_t seqnum){
+static struct rte_mbuf*ng_send_icmp(struct rte_mempool *mbuf_pool,uint8_t *dmac,uint32_t dip,uint32_t sip,uint16_t id,uint16_t seqnum){
     struct rte_mbuf*m=rte_pktmbuf_alloc(mbuf_pool);
     if(m==NULL){
         rte_exit(EXIT_FAILURE,"Cannot create tx mbuf\n");
@@ -424,7 +432,7 @@ static void arp_request_timer(__attribute__((unused)) struct rte_timer *tim,
         #endif
         int i=0;
         for(i=1;i<254;i++){
-            uint32_t dstip = (gLocalIp & 0x00FFFFFF) | (0xFF000000 & (i << 24));
+            uint32_t dstip = (sip & 0x00FFFFFF) | (0xFF000000 & (i << 24));
             struct in_addr addr;
             addr.s_addr=dstip;
             struct rte_mbuf*arpbuf=NULL;
@@ -455,7 +463,7 @@ struct udp_offload{
 
     unsigned char*data;
     uint16_t data_len;
-}
+};
 
 static struct localhost* gethost_from_ip_port(uint32_t dip,uint16_t dport,uint8_t proto){
     struct localhost*host;
@@ -470,16 +478,16 @@ static struct localhost* gethost_from_ip_port(uint32_t dip,uint16_t dport,uint8_
         struct rte_ipv4_hdr *iphdr = rte_pktmbuf_mtod_offset(mbufs, struct rte_ipv4_hdr *, sizeof(struct rte_ether_hdr));
         struct rte_udp_hdr *udphdr = (struct rte_udp_hdr *)(iphdr + 1);
 
-        struct localhost *host = get_hostinfo_fromip_port(iphdr->dst_addr, udphdr->dst_port, iphdr->next_proto_id);
+        struct localhost *host = gethost_from_ip_port(iphdr->dst_addr, udphdr->dst_port, iphdr->next_proto_id);
             if (host == NULL) {
-                rte_pktmbuf_free(udpmbuf);
+                rte_pktmbuf_free(mbufs);
                 return -3;
             } 
 
 
         struct udp_offload*udp=malloc(sizeof(struct udp_offload));
             if(udp==NULL){
-                rte_ptkmuf_free(mbufs);
+                rte_pktmuf_free(mbufs);
                 return -1;
             }
         udp->sip=iphdr->src_addr;
@@ -498,7 +506,7 @@ static struct localhost* gethost_from_ip_port(uint32_t dip,uint16_t dport,uint8_
         pthread_cond_signal(&host->cond);
         pthread_mutex_unlock(&host->mutex);
         
-        rte_pktmbuf_free(mbufs[i]);
+        rte_pktmbuf_free(mbufs);
     }
 #endif
 
@@ -510,23 +518,23 @@ static struct localhost* gethost_from_ip_port(uint32_t dip,uint16_t dport,uint8_
         while(1){
         struct rte_mbuf *bufs[BURST_SIZE];
         unsigned int nb_rx = rte_ring_mc_dequeue_burst(ring->in, (void **)bufs, BURST_SIZE, NULL);
-        for(int i=0;i<nb_rx;i++){
+        for(unsigned int i=0;i<nb_rx;i++){
             struct rte_ether_hdr *ethhdr = rte_pktmbuf_mtod(bufs[i], struct rte_ether_hdr *);
             #if ENABLE_ARP
             if(ethhdr->ether_type == rte_cpu_to_be_16(RTE_ETHER_TYPE_ARP)) {
                 struct rte_arp_hdr *arphdr = rte_pktmbuf_mtod_offset(bufs[i], struct rte_arp_hdr *, sizeof(struct rte_ether_hdr));
                 if(arphdr->arp.data.arp_tip == sip) {
-                    if(arphdr->arp.opcode == rte_cpu_to_be_16(RTE_ARP_OP_REQUEST)) {
-                        struct rte_mbuf*arpbuf=ng_send_arp(mbuf_pool, arphdr->arp.data.arp_sha.addr_bytes, arphdr->arp.data.arp_tha.addr_bytes, arphdr->arp.data.arp_dip, arphdr->arp.data.arp_sip);
+                    if(arphdr->opcode == rte_cpu_to_be_16(RTE_ARP_OP_REQUEST)) {
+                        struct rte_mbuf*arpbuf=ng_send_arp(mbuf_pool, RTE_ARP_OP_REPLY,smac,arphdr->arp.data.arp_sha.addr_bytes,  arphdr->arp.data.arp_dip, arphdr->arp.data.arp_sip);
                         rte_ring_mp_enqueue_burst(ring->out, (void **)&arpbuf, 1, NULL);
                         printf("Received ARP packet\n");
                         rte_pktmbuf_free(bufs[i]);
                     }
-                    else if(arphdr->arp.opcode == rte_cpu_to_be_16(RTE_ARP_OP_REPLY)) {
+                    else if(arphdr->opcode == rte_cpu_to_be_16(RTE_ARP_OP_REPLY)) {
                         struct arp_table*table=arp_table_instance();
-                        uint8_t*mac=arp_table_mac_lookup(arphdr->arp.data.arp_sip);
+                        uint8_t*mac=arp_table_mac_lookup(arphdr->data.arp_sip);
                         if(mac==NULL){
-                            arp_entry*entry=rte_malloc(NULL,sizeof(arp_entry),0);
+                            struct arp_entry*entry=rte_malloc(NULL,sizeof(arp_entry),0);
                             if(entry){
                                 entry->ip=arphdr->arp.data.arp_sip;
                                 rte_memcpy(entry->mac,arphdr->arp.data.arp_sha.addr_bytes,RTE_ETHER_ADDR_LEN);
