@@ -1704,15 +1704,19 @@ static int ng_tcp_out(struct rte_mempool*mbuf_pool){
 int epoll_event_callback(struct eventpoll *ep, int sockid, uint32_t event){
     struct epitem tmp;
 	tmp.sockfd = sockid;
+    pthread_mutex_lock(&ep->mtx);
 	struct epitem *epi = RB_FIND(_epoll_rb_socket, &ep->rbr, &tmp);
 	if (!epi) {
 		printf("rbtree not exist\n");
+        pthread_mutex_unlock(&ep->mtx);
 		return -1;
 	}
 	if (epi->rdy) {
 		epi->event.events |= event;
+        pthread_mutex_unlock(&ep->mtx);
 		return 1;
 	} 
+    pthread_mutex_unlock(&ep->mtx);
 
 	printf("epoll_event_callback --> %d\n", epi->sockfd);
 	
@@ -1786,7 +1790,7 @@ int epoll_create(int size){
 
 }
 
-int epoll_ctl(int epfd,int op,int sockid,struct epoll_event*ev){
+int nepoll_ctl(int epfd,int op,int sockid,struct epoll_event*ev){
     struct eventpoll *ep = (struct eventpoll*)get_hostinfo_fromfd(epfd);
 	if (!ep || (!event && op != EPOLL_CTL_DEL)) {
 		errno = -EINVAL;
@@ -1865,7 +1869,7 @@ int epoll_ctl(int epfd,int op,int sockid,struct epoll_event*ev){
 
 }
 
-int epoll_wait(int epfd,struct epoll_event*events,int maxevents,int timeout){
+int nepoll_wait(int epfd,struct epoll_event*events,int maxevents,int timeout){
     struct eventpoll *ep = (struct eventpoll*)get_hostinfo_fromfd(epfd);
 	if (!ep || !events || maxevents <= 0) {
 		rte_errno = -EINVAL;
